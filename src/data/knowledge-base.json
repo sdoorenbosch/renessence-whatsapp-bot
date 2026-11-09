@@ -55,14 +55,9 @@
       "credit_on_cancel": "Wanneer je een afspraak annuleert, krijg je de exacte behandelingen die geboekt waren terug als treatment credits — NIET als geld terug op je cadeaubon. Je kunt de gecrediteerde behandeling daarna op elk gewenst beschikbaar tijdstip opnieuw boeken via je gastaccount."
     },
     "late_arrival": {
-      "how_it_works": "De geboekte starttijd bevat al de aankomst- en voorbereidingstijd. Die inbegrepen voorbereidingstijd is tegelijk de maximale 'grace period' bij te laat komen — de behandeling zelf kan NIET later beginnen (therapeuten en ruimtes zitten back-to-back in schema).",
-      "grace_period_per_treatment": {
-        "5_minuten": "Massages (Tailored, Prenatal, Lymphatic Drainage), Renewal Facial, Nervous System Reset, Let It Go",
-        "10_minuten": "Hyperbaric Oxygen Hydroxy, Red Light Therapy, Hydrowave (Hydrowave hoort in deze groep, NIET bij de massages)",
-        "15_minuten": "Infrared Sauna, Finnish Sauna, Float"
-      },
-      "later_than_grace": "Later dan de grace period van jouw behandeling? De starttijd schuift niet op — we starten direct bij aankomst en maken het beste van de resterende tijd (geen restitutie voor gemiste tijd).",
-      "note": "Noem NOOIT een generieke '10-15 minuten' grace period; het hangt van de behandeling af. Behandeling onbekend? Eerst vragen welke behandeling iemand heeft."
+      "policy": "Let op: als je te laat komt voor je afspraak, kan het zijn dat we de behandeltijd daarop moeten aanpassen, zodat we alle geplande afspraken kunnen laten doorgaan.",
+      "how_it_works": "Therapeuten en ruimtes zitten back-to-back in schema: de behandeling kan niet later beginnen of uitlopen. We starten zodra je er bent; gemiste tijd wordt niet terugbetaald.",
+      "note": "Gebruik nooit de term 'grace period' en noem nooit een aantal minuten dat iemand te laat mag komen."
     },
     "membership_cancellation": {
       "right_of_withdrawal": "Binnen 14 dagen na inschrijving gratis annuleren.",
