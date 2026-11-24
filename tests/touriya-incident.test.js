@@ -157,7 +157,9 @@ const HERS = 'touriya.sauna@guest.fixture';  // the same address as the model pa
 
 // Her profile as the bot left it on 27 Sep, and one as the front desk makes it.
 const POLLUTED = { Id: 7, FirstName: 'Touriya', LastName: 'WhatsApp', Email: INVENTED };
-const REAL = { Id: 8, FirstName: 'Touriya', LastName: 'Fixture', Email: HERS, Active: true };
+// Her WhatsApp number is on it: a profile found by email is only hers when it
+// is (tests/profile-ownership.test.js).
+const REAL = { Id: 8, FirstName: 'Touriya', LastName: 'Fixture', Email: HERS, MobilePhone: '+31600000027', Active: true };
 
 /** Something the guest wrote in this chat (the 30-minute memory). */
 const typed = (text, from = PHONE) => conversations.addMessage(from, 'user', text);
@@ -1080,7 +1082,7 @@ describe('review round: the website chat', () => {
   test('a profile Mindbody says exists already is looked for by the visitor\'s email only', async () => {
     typed('Vera Visitor vera@guest.fixture 06 1234 5678', WEB);
     mindbody.addClient.mockRejectedValue(Object.assign(new Error('exists'), { response: { data: { Error: { Code: 'InvalidClientCreation' } } } }));
-    mindbody.searchClientByEmail.mockResolvedValueOnce(null).mockResolvedValue({ Id: 55, FirstName: 'Vera', LastName: 'Visitor', Email: 'vera@guest.fixture' });
+    mindbody.searchClientByEmail.mockResolvedValueOnce(null).mockResolvedValue({ Id: 55, FirstName: 'Vera', LastName: 'Visitor', Email: 'vera@guest.fixture', MobilePhone: '+31612345678' });
     const r = await bookClass({ client_name: 'Vera Visitor', client_email: 'vera@guest.fixture', client_phone: '0612345678' }, WEB);
     expect(r.success).toBe(true);
     expect(mindbody.getClientByPhone).not.toHaveBeenCalled();

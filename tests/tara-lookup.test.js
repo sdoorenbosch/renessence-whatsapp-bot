@@ -94,7 +94,7 @@ const { checkReply, correctReply } = require('../src/agents/reply-guards');
 const PHONE = '31600000124';
 const WEB = 'web_tara';
 const EMAIL = 'tara@guest.fixture';
-const CLIENT = { Id: '100000111', FirstName: 'Tara', LastName: 'Guest', Email: EMAIL };
+const CLIENT = { Id: '100000111', FirstName: 'Tara', LastName: 'Guest', Email: EMAIL, MobilePhone: `+${PHONE}` }; // her WhatsApp number is on it (tests/profile-ownership.test.js)
 
 // Flat rows, as the live endpoint returns them.
 const flat = (id, start, sessionTypeId, extra = {}) => ({
@@ -415,10 +415,11 @@ describe('4. the cancel flow and a plain lookup', () => {
 describe('5. website chat and Dutch', () => {
   test('web chat gets the email sentence, not the WhatsApp one', async () => {
     script(
-      [call('g', 'get_appointments', { client_email: EMAIL, ...HER_CHECK })],
+      [call('g', 'get_appointments', { client_email: EMAIL, client_phone: PHONE, ...HER_CHECK })],
       [respond('r', REPLY_OF_19_NOV)],
     );
-    const reply = await agent.runWeb('tara', EMAIL);
+    // On the website the profile must carry a number the visitor typed.
+    const reply = await agent.runWeb('tara', `${EMAIL} ${PHONE}`);
     expect(reply).toMatchObject({ message: `${LIST_OF_20_NOV}\n\n${COUNT_LINE}\n\n${NEEDS_TEAM_WEB}`, ui_type: 'text' });
     expect(reply.message).not.toMatch(/WhatsApp/);
     expect(email.sendEscalationEmail).toHaveBeenCalledWith(expect.objectContaining({ customerPhone: WEB, customerEmail: EMAIL }));
@@ -669,10 +670,10 @@ describe('7. found in review', () => {
 
   test('website chat: a plain lookup\'s list and the model\'s answer come as one message', async () => {
     script(
-      [call('g', 'get_appointments', { client_email: EMAIL, customer_expects: '' })],
+      [call('g', 'get_appointments', { client_email: EMAIL, client_phone: PHONE, customer_expects: '' })],
       [respond('r', 'Anything else?')],
     );
-    const reply = await agent.runWeb('tara', 'what have I booked?');
+    const reply = await agent.runWeb('tara', `what have I booked? ${EMAIL} ${PHONE}`);
     expect(reply.message).toBe(`${LIST_OF_20_NOV}\n\n${COUNT_LINE}\n\nAnything else?`);
   });
 
