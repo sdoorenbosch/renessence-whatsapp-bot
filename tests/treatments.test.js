@@ -75,7 +75,7 @@ describe('a paused treatment', () => {
     const avail = await toolCheckAvailability(PHONE, { session_type_ids: [58], start_date: '2026-11-12', end_date: '2026-11-12' });
     expect(avail.error).toBe('service_paused');
     expect(avail.message).toMatch(/Float Journey/);
-    const book = await toolBookAppointment(PHONE, { session_type_id: 58, start_date_time: '2026-11-12T10:00:00', client_name: 'Ann Smit', client_email: 'ann@example.com' });
+    const book = await toolBookAppointment(PHONE, { session_type_id: 58, start_date_time: '2026-11-12T10:00:00', client_name: 'Ann Smit', client_email: 'ann@guest.fixture' });
     expect(book.error).toBe('service_paused');
     expect(mindbody.getBookableItems).not.toHaveBeenCalled();
     expect(mindbody.addAppointment).not.toHaveBeenCalled();
@@ -103,7 +103,7 @@ test('pausing one massage removes just that option from the massages list', asyn
   expect(subIds).not.toContain('svc_pm');
   expect(subIds).toContain('svc_tm');
   expect(prompt()).not.toMatch(/"svc_pm"/);
-  const book = await toolBookAppointment(PHONE, { session_type_id: 36, start_date_time: '2026-11-12T10:00:00', client_name: 'Ann Smit', client_email: 'ann@example.com' });
+  const book = await toolBookAppointment(PHONE, { session_type_id: 36, start_date_time: '2026-11-12T10:00:00', client_name: 'Ann Smit', client_email: 'ann@guest.fixture' });
   expect(book.error).toBe('service_paused');
 });
 
@@ -111,7 +111,7 @@ test('paused classes can not be listed or booked', async () => {
   await settings.save('treatments', edited(t => { t.items.classes.paused = true; }), { by });
   const sched = await toolCheckClassSchedule(PHONE, { session_type_ids: [83], start_date: '2026-11-12', end_date: '2026-11-12' });
   expect(sched.error).toBe('service_paused');
-  const book = await toolBookClass(PHONE, { class_id: 1, session_type_id: 83, class_name: 'Vinyasa', class_date_time: '2026-11-12T10:00:00', client_name: 'Ann Smit', client_email: 'ann@example.com' });
+  const book = await toolBookClass(PHONE, { class_id: 1, session_type_id: 83, class_name: 'Vinyasa', class_date_time: '2026-11-12T10:00:00', client_name: 'Ann Smit', client_email: 'ann@guest.fixture' });
   expect(book.error).toBe('service_paused');
   expect(mindbody.getClasses).not.toHaveBeenCalled();
 });

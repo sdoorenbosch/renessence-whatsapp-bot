@@ -86,9 +86,17 @@ const MASSAGE_60 = 31;   // €130, pay-online
 const FLOAT = 58;        // €80, pay-on-location
 const START = '2026-08-25T14:00:00';
 
-const CLIENT = { Id: 7, FirstName: 'Test', LastName: 'Guest', Email: 'guest@example.com' };
+const CLIENT = { Id: 7, FirstName: 'Test', LastName: 'Guest', Email: 'guest@guest.fixture' };
 
 function cart() { return conversations.get(PHONE)?.pendingBookings || []; }
+
+/**
+ * Something the guest wrote in this chat. Since Touriya (27 Sep 2026) an email
+ * address only counts when the guest typed it, it is on their profile or it
+ * is stored for their number — so a test that books a NEW or SECOND person
+ * first has the guest type that person's address.
+ */
+function typed(text) { conversations.addMessage(PHONE, 'user', text); }
 
 /** The customer tapped Confirm — required before any fresh booking. */
 function confirmed() {
@@ -138,7 +146,7 @@ describe('toolBookAppointment records the cart (audit #9)', () => {
     confirmed();
     const result = await toolBookAppointment(PHONE, {
       session_type_id: MASSAGE_60, start_date_time: START,
-      client_name: 'Test Guest', client_email: 'guest@example.com',
+      client_name: 'Test Guest', client_email: 'guest@guest.fixture',
     });
 
     expect(result.deferred).toBe(true);
@@ -162,7 +170,7 @@ describe('toolBookAppointment records the cart (audit #9)', () => {
     confirmed();
     const result = await toolBookAppointment(PHONE, {
       session_type_id: FLOAT, start_date_time: START,
-      client_name: 'Test Guest', client_email: 'guest@example.com',
+      client_name: 'Test Guest', client_email: 'guest@guest.fixture',
     });
 
     expect(result.payOnLocation).toBe(true);
@@ -178,7 +186,7 @@ describe('toolBookAppointment records the cart (audit #9)', () => {
     confirmed();
     const result = await toolBookAppointment(PHONE, {
       session_type_id: MASSAGE_60, start_date_time: START, skip_payment: true,
-      client_name: 'Test Guest', client_email: 'guest@example.com',
+      client_name: 'Test Guest', client_email: 'guest@guest.fixture',
     });
 
     expect(result.error).toBe('reschedules_are_team_handled');
@@ -541,7 +549,7 @@ describe('journey resolution (audit #7/#8)', () => {
 
     const result = await toolBookClass(PHONE, {
       class_id: 4001, session_type_id: 83, class_name: 'Vinyasa Flow',
-      class_date_time: START, client_name: 'Test Guest', client_email: 'guest@example.com',
+      class_date_time: START, client_name: 'Test Guest', client_email: 'guest@guest.fixture',
     });
 
     expect(payments.expireSession).toHaveBeenCalledWith('cs_class');
@@ -555,7 +563,7 @@ describe('journey resolution (audit #7/#8)', () => {
 
     const result = await toolBookClass(PHONE, {
       class_id: 4001, session_type_id: 83, class_name: 'Vinyasa Flow',
-      class_date_time: START, client_name: 'Test Guest', client_email: 'guest@example.com',
+      class_date_time: START, client_name: 'Test Guest', client_email: 'guest@guest.fixture',
     });
 
     expect(result.paymentUrl).toBe('https://pay.stripe.test/cs_class');
@@ -571,7 +579,7 @@ describe('journey resolution (audit #7/#8)', () => {
 
     const result = await toolBookClass(PHONE, {
       class_id: 4001, session_type_id: 83, class_name: 'Vinyasa Flow',
-      class_date_time: START, client_name: 'Test Guest', client_email: 'guest@example.com',
+      class_date_time: START, client_name: 'Test Guest', client_email: 'guest@guest.fixture',
     });
 
     expect(payments.createPaymentLink).not.toHaveBeenCalled();
@@ -587,7 +595,7 @@ describe('journey resolution (audit #7/#8)', () => {
 
     await toolBookClass(PHONE, {
       class_id: 4001, session_type_id: 83, class_name: 'Vinyasa Flow',
-      class_date_time: START, client_name: 'Test Guest', client_email: 'guest@example.com',
+      class_date_time: START, client_name: 'Test Guest', client_email: 'guest@guest.fixture',
     });
 
     expect(db.logError).toHaveBeenCalledWith(
@@ -601,7 +609,7 @@ describe('journey resolution (audit #7/#8)', () => {
 
     const result = await toolBookClass(PHONE, {
       class_id: 4001, session_type_id: 83, class_name: 'Vinyasa Flow',
-      class_date_time: START, client_name: 'Test Guest', client_email: 'guest@example.com',
+      class_date_time: START, client_name: 'Test Guest', client_email: 'guest@guest.fixture',
     });
 
     expect(result.paymentError).toBe(true);
@@ -621,7 +629,7 @@ describe('journey resolution (audit #7/#8)', () => {
 
     const result = await toolBookAppointment(PHONE, {
       session_type_id: MASSAGE_60, start_date_time: START,
-      client_name: 'Test Guest', client_email: 'guest@example.com',
+      client_name: 'Test Guest', client_email: 'guest@guest.fixture',
     });
 
     expect(result.error).toBe('booking_failed');
@@ -636,7 +644,7 @@ describe('journey resolution (audit #7/#8)', () => {
 
     await toolBookAppointment(PHONE, {
       session_type_id: MASSAGE_60, start_date_time: START,
-      client_name: 'Test Guest', client_email: 'guest@example.com',
+      client_name: 'Test Guest', client_email: 'guest@guest.fixture',
     });
 
     expect(db.logError).toHaveBeenCalledWith(
@@ -762,14 +770,15 @@ describe('unclear Mindbody answers (timeout / 5xx) in the book-first flow', () =
 });
 
 describe('a second person in the same chat (Gina & Nathalie)', () => {
-  const GINA = { Id: 7, FirstName: 'Gina', LastName: 'van Spall', Email: 'gina@example.com' };
+  const GINA = { Id: 7, FirstName: 'Gina', LastName: 'van Spall', Email: 'gina@guest.fixture' };
 
   test('is booked on their own new profile — never on the chat owner\'s, never without a phone tie', async () => {
     confirmed();
     mindbody.getClientByPhone.mockResolvedValue(GINA);
-    const r = await toolBookAppointment(PHONE, { session_type_id: FLOAT, start_date_time: START, client_name: 'Nathalie Link', client_email: 'nathalie@example.com' });
+    typed('Nathalie Link, nathalie@guest.fixture');
+    const r = await toolBookAppointment(PHONE, { session_type_id: FLOAT, start_date_time: START, client_name: 'Nathalie Link', client_email: 'nathalie@guest.fixture' });
     expect(r.success).toBe(true);
-    expect(mindbody.addClient).toHaveBeenCalledWith(expect.objectContaining({ firstName: 'Nathalie', email: 'nathalie@example.com', mobilePhone: null }));
+    expect(mindbody.addClient).toHaveBeenCalledWith(expect.objectContaining({ firstName: 'Nathalie', email: 'nathalie@guest.fixture', mobilePhone: null }));
     expect(mindbody.addAppointment).toHaveBeenCalledWith(expect.objectContaining({ clientId: 77 }));
     expect(db.logBookingEvent).toHaveBeenCalledWith(expect.objectContaining({ customerName: 'Nathalie Link' }));
   });
@@ -778,7 +787,8 @@ describe('a second person in the same chat (Gina & Nathalie)', () => {
     confirmed();
     mindbody.getClientByPhone.mockResolvedValue(GINA);
     db.getRecentBooking.mockResolvedValueOnce({ id: 900, status: 'pay_on_location', customer_name: 'Gina van Spall', mindbody_appointment_id: 9001 });
-    const r = await toolBookAppointment(PHONE, { session_type_id: FLOAT, start_date_time: START, client_name: 'Nathalie Link', client_email: 'nathalie@example.com' });
+    typed('Nathalie Link, nathalie@guest.fixture');
+    const r = await toolBookAppointment(PHONE, { session_type_id: FLOAT, start_date_time: START, client_name: 'Nathalie Link', client_email: 'nathalie@guest.fixture' });
     expect(r.already_booked).toBeUndefined();
     expect(mindbody.addAppointment).toHaveBeenCalledTimes(1);
   });
@@ -787,7 +797,8 @@ describe('a second person in the same chat (Gina & Nathalie)', () => {
     confirmed();
     mindbody.getClientByPhone.mockResolvedValue(GINA);
     mindbody.searchClientByEmail.mockResolvedValueOnce({ Id: 55, FirstName: 'Nathalie', LastName: 'Link' });
-    await toolBookAppointment(PHONE, { session_type_id: FLOAT, start_date_time: START, client_name: 'Nathalie Link', client_email: 'nathalie@example.com' });
+    typed('Nathalie Link, nathalie@guest.fixture');
+    await toolBookAppointment(PHONE, { session_type_id: FLOAT, start_date_time: START, client_name: 'Nathalie Link', client_email: 'nathalie@guest.fixture' });
     expect(mindbody.addClient).not.toHaveBeenCalled();
     expect(mindbody.addAppointment).toHaveBeenCalledWith(expect.objectContaining({ clientId: 55 }));
   });
@@ -796,7 +807,8 @@ describe('a second person in the same chat (Gina & Nathalie)', () => {
     confirmed();
     mindbody.getClientByPhone.mockResolvedValue(GINA);
     mindbody.addClient.mockRejectedValueOnce(new Error('MobilePhone is required'));
-    await toolBookAppointment(PHONE, { session_type_id: FLOAT, start_date_time: START, client_name: 'Nathalie Link', client_email: 'nathalie@example.com' });
+    typed('Nathalie Link, nathalie@guest.fixture');
+    await toolBookAppointment(PHONE, { session_type_id: FLOAT, start_date_time: START, client_name: 'Nathalie Link', client_email: 'nathalie@guest.fixture' });
     expect(mindbody.addAppointment).toHaveBeenCalledWith(expect.objectContaining({ clientId: 7, notes: expect.stringMatching(/For: Nathalie Link/) }));
     expect(db.logError).toHaveBeenCalledWith('companion_profile_failed', expect.any(String), '', expect.any(String));
   });
@@ -804,7 +816,7 @@ describe('a second person in the same chat (Gina & Nathalie)', () => {
   test('the owner booking for themselves (same first name) stays on their own profile', async () => {
     confirmed();
     mindbody.getClientByPhone.mockResolvedValue(GINA);
-    await toolBookAppointment(PHONE, { session_type_id: FLOAT, start_date_time: START, client_name: 'Gina Spall', client_email: 'other@example.com' });
+    await toolBookAppointment(PHONE, { session_type_id: FLOAT, start_date_time: START, client_name: 'Gina Spall', client_email: 'other@guest.fixture' });
     expect(mindbody.addClient).not.toHaveBeenCalled();
     expect(mindbody.addAppointment).toHaveBeenCalledWith(expect.objectContaining({ clientId: 7 }));
   });
@@ -812,13 +824,15 @@ describe('a second person in the same chat (Gina & Nathalie)', () => {
 
 describe('telling people apart (review round)', () => {
   const GEORGINA = { Id: 7, FirstName: 'Georgina', LastName: 'van Spall', Email: '' };
-  const GINA = { Id: 7, FirstName: 'Gina', LastName: 'van Spall', Email: 'gina@example.com' };
+  const GINA = { Id: 7, FirstName: 'Gina', LastName: 'van Spall', Email: 'gina@guest.fixture' };
 
   test('an owner using a nickname ("Gina" for profile "Georgina") stays on her own profile', async () => {
     confirmed();
     conversations.update(PHONE, { userName: 'Gina' });
     mindbody.getClientByPhone.mockResolvedValue(GEORGINA);
-    await toolBookAppointment(PHONE, { session_type_id: FLOAT, start_date_time: START, client_name: 'Gina van Spall', client_email: 'gina.other@example.com' });
+    // Her profile has no address, so the one she gives must be one she typed.
+    typed('gina.other@guest.fixture');
+    await toolBookAppointment(PHONE, { session_type_id: FLOAT, start_date_time: START, client_name: 'Gina van Spall', client_email: 'gina.other@guest.fixture' });
     expect(mindbody.addClient).not.toHaveBeenCalled();
     expect(mindbody.addAppointment).toHaveBeenCalledWith(expect.objectContaining({ clientId: 7 }));
   });
@@ -827,7 +841,7 @@ describe('telling people apart (review round)', () => {
     confirmed();
     conversations.update(PHONE, { userName: 'Gina' });
     mindbody.getClientByPhone.mockResolvedValue(GINA);
-    await toolBookAppointment(PHONE, { session_type_id: FLOAT, start_date_time: START, client_name: 'Nathalie Link', client_email: 'gina@example.com' });
+    await toolBookAppointment(PHONE, { session_type_id: FLOAT, start_date_time: START, client_name: 'Nathalie Link', client_email: 'gina@guest.fixture' });
     expect(mindbody.addClient).not.toHaveBeenCalled();
     expect(mindbody.addAppointment).toHaveBeenCalledWith(expect.objectContaining({ clientId: 7, notes: expect.stringMatching(/For: Nathalie Link/) }));
   });
@@ -836,7 +850,8 @@ describe('telling people apart (review round)', () => {
     confirmed();
     mindbody.getClientByPhone.mockResolvedValue(GINA);
     mindbody.searchClientByEmail.mockResolvedValueOnce({ Id: 60, FirstName: 'Ingrid', LastName: 'Link' });
-    await toolBookAppointment(PHONE, { session_type_id: FLOAT, start_date_time: START, client_name: 'Nathalie Link', client_email: 'link.family@example.com' });
+    typed('Nathalie Link, link.family@guest.fixture');
+    await toolBookAppointment(PHONE, { session_type_id: FLOAT, start_date_time: START, client_name: 'Nathalie Link', client_email: 'link.family@guest.fixture' });
     expect(mindbody.addClient).toHaveBeenCalled();
     expect(mindbody.addAppointment).toHaveBeenCalledWith(expect.objectContaining({ clientId: 77 }));
   });
@@ -849,7 +864,8 @@ describe('telling people apart (review round)', () => {
       const rows = [{ id: 1, customer_name: 'Anna Bakker', mindbody_appointment_id: 9001, status: 'pay_on_location' }];
       return (matches ? rows.find(matches) : rows[0]) || null;
     });
-    const r = await toolBookAppointment(PHONE, { session_type_id: FLOAT, start_date_time: START, client_name: 'Anna Smit', client_email: 'annas@example.com' });
+    typed('Anna Smit annas@guest.fixture');
+    const r = await toolBookAppointment(PHONE, { session_type_id: FLOAT, start_date_time: START, client_name: 'Anna Smit', client_email: 'annas@guest.fixture' });
     expect(r.already_booked).toBeUndefined();
     expect(mindbody.addAppointment).toHaveBeenCalledWith(expect.objectContaining({ clientId: 61 }));
   });
@@ -861,7 +877,8 @@ describe('new guests keep their phone on their profile', () => {
     conversations.update(PHONE, { userName: 'Liz' });
     mindbody.getClientByPhone.mockResolvedValue(null);
     mindbody.addClient.mockResolvedValueOnce({ Id: 80, FirstName: 'Elizabeth', LastName: 'Jansen' });
-    await toolBookAppointment(PHONE, { session_type_id: FLOAT, start_date_time: START, client_name: 'Elizabeth Jansen', client_email: 'liz@example.com' });
+    typed('Elizabeth Jansen, liz@guest.fixture');
+    await toolBookAppointment(PHONE, { session_type_id: FLOAT, start_date_time: START, client_name: 'Elizabeth Jansen', client_email: 'liz@guest.fixture' });
     expect(mindbody.addClient).toHaveBeenCalledWith(expect.objectContaining({ mobilePhone: PHONE }));
   });
 
@@ -870,7 +887,8 @@ describe('new guests keep their phone on their profile', () => {
     conversations.update(PHONE, { userName: 'Gina van Spall' });
     mindbody.getClientByPhone.mockResolvedValue(null);
     mindbody.addClient.mockResolvedValueOnce({ Id: 81, FirstName: 'Nathalie', LastName: 'Link' });
-    await toolBookAppointment(PHONE, { session_type_id: FLOAT, start_date_time: START, client_name: 'Nathalie Link', client_email: 'nathalie@example.com' });
+    typed('Nathalie Link, nathalie@guest.fixture');
+    await toolBookAppointment(PHONE, { session_type_id: FLOAT, start_date_time: START, client_name: 'Nathalie Link', client_email: 'nathalie@guest.fixture' });
     expect(mindbody.addClient).toHaveBeenCalledWith(expect.objectContaining({ mobilePhone: null }));
   });
 });

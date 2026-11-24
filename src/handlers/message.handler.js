@@ -7,9 +7,55 @@ const introPromoService = require('../services/intro-promo.service');
 const teamQueue = require('../services/team-queue.service');
 const { isBotPaused } = require('../routes/dashboard.routes');
 const { TEXT_ONLY_ACK } = require('../config/non-text');
+const teamContext = require('../agents/team-context');
 
 // H5: per-user lock — prevents concurrent agent.run() for the same phone number
 const { withUserLock } = require('../utils/user-lock');
+
+// ---- Staying out of a colleague's conversation ----
+// Tara, 4 Nov 2026: the chat was handed back to the bot six minutes after a
+// colleague's message; the guest's reaction was answered by the bot, which
+// contradicted the colleague, and she was never told the AI was answering
+// again. A guest message that arrives within TEAM_REPLY_HOLD_MIN minutes of a
+// colleague's last message stays with the team (0 = off).
+function teamReplyHoldMin() {
+  const n = parseInt(process.env.TEAM_REPLY_HOLD_MIN ?? '30', 10);
+  return Number.isFinite(n) && n >= 0 ? n : 30;
+}
+
+/**
+ * The colleague's message this guest is writing after, or null — when the bot
+ * or nobody wrote last, on the website chat, and on any database error (the
+ * bot then behaves exactly as before).
+ */
+async function colleagueThreadFor(from) {
+  if (String(from).startsWith('web_')) return null;
+  try {
+    return teamContext.colleagueThread(await db.getLastOutboundMessage?.(from), new Date());
+  } catch (err) {
+    logger.warn(`[${from}] colleague check failed (ignored):`, err.message);
+    return null;
+  }
+}
+
+const withinHold = (thread) => {
+  const hold = teamReplyHoldMin();
+  return !!thread && hold > 0 && thread.minutesAgo < hold;
+};
+
+/** The bot answers after a colleague: the team checks when their message is recent or holds an open question. */
+function flagColleagueThread(from, thread, what) {
+  if (!(thread.recent || thread.question)) return;
+  const of = teamContext.stamp(thread.question ? thread.question.at : thread.at);
+  db.setNeedsReply(from, `${what} after a colleague's message of ${of} — the bot answered, please check`);
+}
+
+/** Back to the team: paused again (no takeover notice — they were already told), flagged. */
+async function holdForTeam(from, name, thread) {
+  await db.pauseConversation(from, name);
+  db.setNeedsReply(from, `Guest replied ${Math.max(0, Math.round(thread.minutesAgo))} min after your message — bot paused again`);
+  logger.info(`[${from}] Reply ${Math.round(thread.minutesAgo)} min after a colleague — kept for the team, bot paused again`);
+}
 
 async function handle(incomingMessage) {
   const { from, name, text, buttonReply, listReply } = incomingMessage;
@@ -96,6 +142,30 @@ async function handle(incomingMessage) {
     return;
   }
 
+  // A colleague wrote last. Within the hold the message is theirs to answer,
+  // although the bot was switched back on. Later the bot answers, and its
+  // first reply says the AI is answering again — with the colleague's
+  // question, if the guest never answered it — and the team is flagged.
+  const thread = await colleagueThreadFor(from);
+  if (withinHold(thread)) {
+    await db.logMessage(from, 'user', userMessage);
+    await holdForTeam(from, name, thread);
+    await teamQueue.deliverQueuedTeamMessages(from).catch(err => logger.warn('Queued team delivery failed:', err.message));
+    return;
+  }
+  if (thread) {
+    // Not again for the same colleague message: a second guest message can
+    // arrive while the first reply (which carried the line) is being sent,
+    // before that reply is logged (found in review).
+    if (conversationService.get(from)?.replyPrefixShownFor !== thread.at.getTime()) {
+      conversationService.set(from, { replyPrefix: teamContext.replyPrefix(thread), replyPrefixFor: thread.at.getTime() });
+    }
+    flagColleagueThread(from, thread, 'Guest wrote');
+  } else if (conversationService.get(from)?.replyPrefix) {
+    // One a reply never used (a payment link went out instead) is stale now.
+    conversationService.update(from, { replyPrefix: null });
+  }
+
   // Campaign intro (the PT promotion, 19 Oct – 1 Nov 2026): once per guest,
   // only at the start of a fresh conversation, sent BEFORE the agent's answer
   // so it reads as "before we help you". Inside the guest's lock, so a quick
@@ -143,9 +213,20 @@ async function handleNonText({ from, name, type, alreadyLogged = false, ack = nu
   if (await db.isBlocked(from)) return;
   db.unarchiveConversation(from).catch(err => logger.warn('Auto-unarchive error:', err.message));
 
-  if (await db.isPaused(from)) {
+  const paused = await db.isPaused(from);
+  // A photo or sticker in reply to a colleague stays with them too (Tara, 4
+  // Nov 2026). Not checked while the bot is paused globally — as for text, so
+  // that pause never leaves this one chat paused afterwards (found in review).
+  const thread = paused || isBotPaused() ? null : await colleagueThreadFor(from);
+  if (paused) {
     db.setNeedsReply(from, `New ${type} — bot is paused`);
+  } else if (withinHold(thread)) {
+    await holdForTeam(from, name, thread);
   } else if (ack && !isBotPaused()) {
+    // Later than the hold: often the answer the colleague asked for (a photo
+    // of a gift card). The team is told; the automatic ack is not a reply,
+    // so the colleague's message stays the last one (getLastOutboundMessage).
+    if (thread) flagColleagueThread(from, thread, `Guest sent a ${type}`);
     try {
       await whatsappService.sendText(from, ack);
       // Logged so the chat reads as answered (the outage catch-up replays

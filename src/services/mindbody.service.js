@@ -89,6 +89,54 @@ async function getServices() {
   });
 }
 
+// Tara (19 Nov 2026): the appointments endpoint gives a SessionTypeId, not a
+// name; the team books types the bot does not sell. Every session type's name
+// (not only OnlineOnly), cached for 6 hours. Never throws and never holds a
+// lookup for long: after SESSION_TYPE_NAMES_WAIT_MS the last good map (or {})
+// comes back and the fetch finishes in the background to fill the cache; a
+// failure is remembered for 5 minutes, so a failing endpoint does not cost
+// every lookup a request with retries (found in review).
+const SESSION_TYPE_NAMES_TTL_MS = 6 * 60 * 60 * 1000;
+const SESSION_TYPE_NAMES_WAIT_MS = 2000;
+const SESSION_TYPE_NAMES_RETRY_MS = 5 * 60 * 1000;
+let sessionTypeNames = null;
+let sessionTypeNamesAt = 0;
+let sessionTypeNamesFailedAt = 0;
+let sessionTypeNamesFetch = null;
+async function getSessionTypeNames() {
+  if (sessionTypeNames && Date.now() - sessionTypeNamesAt < SESSION_TYPE_NAMES_TTL_MS) return sessionTypeNames;
+  if (sessionTypeNamesFailedAt && Date.now() - sessionTypeNamesFailedAt < SESSION_TYPE_NAMES_RETRY_MS) return sessionTypeNames || {};
+  if (!sessionTypeNamesFetch) {
+    sessionTypeNamesFetch = (async () => {
+      try {
+        const types = await withRetry(async () => {
+          const headers = await authHeaders();
+          const res = await api.get('/site/sessiontypes', { headers, params: { Limit: 200 } });
+          return res.data.SessionTypes || [];
+        });
+        const map = {};
+        for (const t of types) if (t && t.Id !== undefined && t.Id !== null && t.Name) map[t.Id] = String(t.Name);
+        sessionTypeNames = map;
+        sessionTypeNamesAt = Date.now();
+        sessionTypeNamesFailedAt = 0;
+      } catch (err) {
+        sessionTypeNamesFailedAt = Date.now();
+        logger.warn('Mindbody session type names unavailable:', err.message);
+      } finally {
+        sessionTypeNamesFetch = null;
+      }
+    })();
+  }
+  let timer;
+  const waited = new Promise((resolve) => {
+    timer = setTimeout(resolve, SESSION_TYPE_NAMES_WAIT_MS);
+    if (timer.unref) timer.unref();
+  });
+  await Promise.race([sessionTypeNamesFetch, waited]);
+  clearTimeout(timer);
+  return sessionTypeNames || {};
+}
+
 // ---- Availability ----
 
 // Mindbody caps list responses (default 100 items, max 200 per request). A
@@ -609,6 +657,32 @@ async function searchClientByName(name) {
 }
 
 /**
+ * One client's full profile (search results often leave Email out), or null.
+ * Only the profile that was asked for: "the first row" was good enough while
+ * the caller merely compared its email with the one it searched for, but the
+ * booking tools take this profile's address as the guest's own (Touriya
+ * review, Nov 2026) — and if Mindbody ever ignores the id filter, the first
+ * row is the first of ALL clients.
+ */
+async function fetchClientProfile(headers, clientId) {
+  const r = await api.get('/client/clients', {
+    headers,
+    params: { ClientIds: [String(clientId)] },
+  });
+  return (r.data.Clients || []).find(c => String(c.Id) === String(clientId)) || null;
+}
+
+/**
+ * A client's full profile by Mindbody id, or null when there is none.
+ * Touriya, 27 Sep 2026: the booking tools read it to see whether a profile
+ * really has an email address, and to find a returning guest by the profile
+ * they booked on before when the phone search misses.
+ */
+async function getClientById(clientId) {
+  return withRetry(async () => fetchClientProfile(await authHeaders(), clientId));
+}
+
+/**
  * Search for a client by email address.
  * Mindbody's SearchText does NOT reliably index email, so we use multiple
  * fallback strategies to find the client.
@@ -626,11 +700,7 @@ async function searchClientByEmail(email) {
     // Helper: fetch full client profile by ID (to get Email field)
     const fetchClientById = async (clientId) => {
       try {
-        const r = await api.get('/client/clients', {
-          headers,
-          params: { ClientIds: [String(clientId)] },
-        });
-        return (r.data.Clients || [])[0] || null;
+        return await fetchClientProfile(headers, clientId);
       } catch (_) { return null; }
     };
 
@@ -1066,6 +1136,7 @@ async function addClientToClass(clientId, classId) {
 module.exports = {
   RESOURCE_MAP,
   getServices,
+  getSessionTypeNames,
   findClientAppointmentAt,
   getRoomOccupancy,
   invalidateRoomOccupancy,
@@ -1086,6 +1157,7 @@ module.exports = {
   getStaffAppointments,
   getUpcomingAppointments,
   getClientByPhone,
+  getClientById,
   getAllClientsByPhone,
   searchClientByName,
   searchClientByEmail,
