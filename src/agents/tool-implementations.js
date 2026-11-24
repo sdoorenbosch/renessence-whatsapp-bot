@@ -17,7 +17,11 @@ const dynamicCatalogService = require('../services/dynamic-catalog.service');
 const payFirst = require('../services/pay-first.service');
 const payFirstCfg = require('../config/pay-first');
 const settings = require('../services/settings.service');
+const guestEmail = require('../utils/guest-email');
 const { longDate } = require('./business-facts');
+const appointmentOverview = require('./appointment-overview');
+const teamContext = require('./team-context');
+const { EN_DAYS, dayLabel, weekdayOf, weekdayIndex, rangeDays, weekdaysAround, findWeekdayDates, loneWeekdays } = require('../utils/calendar');
 
 // Static catalog (synchronous — loaded at startup)
 const _catalog = dynamicCatalogService.getCatalog();
@@ -56,6 +60,17 @@ const DISCONTINUED_SESSION_TYPES = new Map([
 // A single Confirm tap may cover a multi-treatment summary; this bounds it.
 // Matches the journey cap (too_many_treatments): a summary can never list more.
 const MAX_BOOKINGS_PER_CONFIRM = 3;
+
+const CONFIRMATION_REQUIRED = {
+  error: 'confirmation_required',
+  message: 'You have not received the customer\'s confirmation yet. This is NOT an error — do not tell the customer something went wrong. Before booking you MUST show the confirmation summary (every treatment for every person, date, time, name + the health and cancellation declaration) with Confirm/Cancel buttons (id "confirm_booking"), and only call book_appointment after the customer taps "Confirm". Show that confirmation now — do NOT book yet.',
+};
+
+/** Did the customer tap "Confirm" (id=confirm_booking) within the last 10 minutes? A look only — it uses nothing up. */
+function confirmedRecently(from) {
+  const conf = conversationService.get(from)?.bookingConfirmedAt;
+  return !!conf && (Date.now() - conf) < 10 * 60 * 1000;
+}
 
 /**
  * Close a confirmation gate that was USED in a previous agent turn. Called by
@@ -138,7 +153,35 @@ function mergeAvailabilityWindows(items) {
   return merged;
 }
 
-async function toolCheckAvailability(from, { session_type_ids, start_date, end_date, part_of_day }) {
+// Melanie, 23 Nov 2026: she asked for "Saturday", the model worked out
+// 2026-11-25 by itself (a Wednesday) and Wednesday's times were shown as
+// Saturday's. With the weekday the customer named, a date that falls on
+// another day is refused before Mindbody is asked — so nothing of that day is
+// offered, or remembered as offered.
+function weekdayMismatch(named, days) {
+  const name = EN_DAYS[named];
+  const first = days[0];
+  const full = (d) => `${dayLabel(d, 'en', { year: true })} (${d})`;
+  const what = days.length === 1
+    ? `${first} is a ${EN_DAYS[weekdayOf(first)]}, not a ${name}`
+    : `there is no ${name} between ${first} and ${days[days.length - 1]}`;
+  // That weekday around the date that was asked for (a request for late
+  // December must not be pointed at this week), and separately the coming one.
+  const around = weekdaysAround(named, first);
+  const near = around.near.length ? ` ${name}s near ${days.length === 1 ? 'that date' : 'those dates'}: ${around.near.map(full).join(' and ')}.` : '';
+  const today = around.today ? ` Today, ${full(around.today)}, is a ${name} too.` : '';
+  return {
+    error: 'weekday_mismatch',
+    slots: [],
+    staff: [],
+    message: `Nothing was checked: ${what}.${near} The coming ${name} is ${full(around.coming)}.${today} If the customer named only the weekday, call check_availability again with the coming ${name}. If the customer gave the date and no weekday, call again with that date and leave weekday out. If they gave both and they do not match, ask which one they mean and name both options.`,
+  };
+}
+
+/** The day(s) of a check_availability result in both languages: the model writes a day by copying one of these. */
+const dayList = (dates) => dates.map(d => ({ date: d, label: dayLabel(d, 'en'), labelNl: dayLabel(d, 'nl') }));
+
+async function toolCheckAvailability(from, { session_type_ids, start_date, end_date, part_of_day, weekday }) {
   // Discontinued treatments never reach Mindbody: drop their IDs, and if
   // nothing else was asked for, answer with the removed-from-menu message.
   const discontinued = session_type_ids.filter(id => DISCONTINUED_SESSION_TYPES.has(Number(id)));
@@ -154,6 +197,36 @@ async function toolCheckAvailability(from, { session_type_ids, start_date, end_d
     session_type_ids = session_type_ids.filter(id => !settings.pausedTreatment(id));
     if (session_type_ids.length === 0) return pausedResult(settings.pausedTreatment(paused[0]));
   }
+
+  // The weekday check (see weekdayMismatch). A range that does contain the
+  // weekday is checked whole — "Saturday or Sunday" is a normal request. A
+  // weekday or a date the server cannot read changes nothing.
+  if (typeof start_date === 'string') start_date = start_date.slice(0, 10);
+  if (typeof end_date === 'string') end_date = end_date.slice(0, 10);
+  const askedDays = rangeDays(start_date, end_date || start_date);
+  {
+    const named = weekdayIndex(weekday);
+    if (named !== null && askedDays.length > 0 && !askedDays.some(d => weekdayOf(d) === named)) {
+      return weekdayMismatch(named, askedDays);
+    }
+  }
+  // What the model is given to write a day with, and to name the day(s) that
+  // were checked when nothing is free: on 23 Nov the only weekday in the
+  // result was a Dutch label in an English chat, and "nothing free" named no
+  // day at all — so "no availability on Friday" could be said of a Wednesday.
+  const lang = conversationService.get(from)?.lang || 'en';
+  const checkedDays = dayList(askedDays);
+  const fullDay = (d) => dayLabel(d, 'en', { year: true });
+  const checkedLabel = askedDays.length === 0
+    ? 'the requested date(s)'
+    : (askedDays.length === 1 ? fullDay(start_date) : `${fullDay(start_date)} – ${fullDay(end_date)}`);
+  const nothingFree = () => ({
+    slots: [],
+    staff: [],
+    no_availability: true,
+    days: checkedDays,
+    message: `No availability found for ${checkedLabel}. Respond to the customer with a friendly message and suggest they try a different date.`,
+  });
 
   // C6: fetch all session types in parallel instead of sequentially
   let anySuccess = false;
@@ -175,7 +248,9 @@ async function toolCheckAvailability(from, { session_type_ids, start_date, end_d
 
   // M8: distinguish "no availability" from "all API calls failed"
   if (!anySuccess) return { error: 'availability_check_failed', slots: [], staff: [] };
-  if (allItems.length === 0) return { slots: [], staff: [] };
+  // Also where a treatment that only runs on certain days ends up when the
+  // date is another day (the filter above): the day is named here too.
+  if (allItems.length === 0) return nothingFree();
 
   // Mindbody returns ONE availability record per schedule-availability ROW the
   // team enters. A therapist afternoon entered as stacked 60-minute rows
@@ -223,7 +298,7 @@ async function toolCheckAvailability(from, { session_type_ids, start_date, end_d
         slots.push({
           id: `slot_${dateTime}_${staffId}_${sessionTypeId}`,
           dateTime,
-          dateLabel: formatDutchDate(dateTime),
+          dateLabel: dayLabel(dateTime, lang),
           timeLabel,
           staffId,
           staffName,
@@ -277,7 +352,7 @@ async function toolCheckAvailability(from, { session_type_ids, start_date, end_d
           slots.push({
             id: `slot_${dateTime}_${staffId}_${sessionTypeId}`,
             dateTime,
-            dateLabel: formatDutchDate(dateTime),
+            dateLabel: dayLabel(dateTime, lang),
             timeLabel: `${pad(t.getHours())}:${pad(t.getMinutes())}`,
             staffId,
             staffName,
@@ -313,7 +388,7 @@ async function toolCheckAvailability(from, { session_type_ids, start_date, end_d
     const [day, c] = [...closedDays.entries()][0];
     const res = closedResult(c, day);
     delete res.error;
-    return { ...res, staff: [] };
+    return { ...res, staff: [], days: checkedDays };
   }
 
   // Pay-first treatments (massages, facial, NSR, Let It Go): only offer a time
@@ -358,16 +433,12 @@ async function toolCheckAvailability(from, { session_type_ids, start_date, end_d
         slots: [],
         staff: [],
         no_availability: true,
+        days: checkedDays,
         notice_required: `${payFirstCfg.PAY_FIRST_OFFER_LEAD_MINUTES} minutes`,
-        message: `There are no times left with enough notice: massages, facials, Nervous System Reset and Let It Go are paid online before they are booked, so they need at least ${payFirstCfg.PAY_FIRST_OFFER_LEAD_MINUTES} minutes' notice. Tell the customer that kindly and suggest a later time or another day — do NOT say we are fully booked.`,
+        message: `There are no times left with enough notice on ${checkedLabel}: massages, facials, Nervous System Reset and Let It Go are paid online before they are booked, so they need at least ${payFirstCfg.PAY_FIRST_OFFER_LEAD_MINUTES} minutes' notice. Tell the customer that kindly and suggest a later time or another day — do NOT say we are fully booked.`,
       };
     }
-    return {
-      slots: [],
-      staff: [],
-      no_availability: true,
-      message: 'No availability found for the requested date(s). Respond to the customer with a friendly message and suggest they try a different date.',
-    };
+    return nothingFree();
   }
 
   // Remember every slot that is genuinely bookable per this check. book_appointment
@@ -429,7 +500,8 @@ async function toolCheckAvailability(from, { session_type_ids, start_date, end_d
       no_slots_in_part: true,
       requested_part: part_of_day,
       available_range: range,
-      message: `No ${part_of_day} slots for the requested date, but there IS availability at other times (from ${range.earliest} to ${range.latest}). Tell the customer there are no ${part_of_day} slots, mention the times that ARE available, and offer another part of the day.`,
+      days: checkedDays,
+      message: `No ${part_of_day} slots for ${checkedLabel}, but there IS availability at other times (from ${range.earliest} to ${range.latest}). Tell the customer there are no ${part_of_day} slots, mention the times that ARE available, and offer another part of the day.`,
     };
   }
 
@@ -456,6 +528,8 @@ async function toolCheckAvailability(from, { session_type_ids, start_date, end_d
   return {
     slots: shownSlots,
     staff,
+    // The day(s) these times are on — they belong to no other day.
+    days: dayList([...new Set(shownSlots.map(sl => sl.dateTime.slice(0, 10)))]),
     total_available: usable.length,
     shown: shownSlots.length,
     // When spread is true the times shown are sampled across the whole day (not
@@ -466,23 +540,58 @@ async function toolCheckAvailability(from, { session_type_ids, start_date, end_d
   };
 }
 
+// Tells the model what it still has to ask BEFORE the confirmation summary.
+// Touriya, 27 Sep 2026: this returned the profile as it was — on a profile
+// like hers that is a placeholder address presented as "her email" and the
+// surname "WhatsApp" as her name — and a Mindbody error looked like "a new
+// guest". The guarantee itself is in the booking tools (resolveBookingGuest).
 async function toolLookupClient(from) {
-  if (from.startsWith('web_')) return { found: false };
+  const newGuest = {
+    found: false,
+    needs_name_and_email: true,
+    message: 'New guest. Before the confirmation summary, ask for their full name (first and last name) and email address (ui_type "none"). Only use what the customer types - never invent a name or an email address.',
+  };
+  if (isWebSession(from)) return newGuest;
+  const stored = await storedContact(from);
+  const storedEmail = usableEmail(stored?.email);
+  let client = null;
   try {
-    const client = await mindbodyService.getClientByPhone(from, null);
-    if (client) {
-      return {
-        found: true,
-        name: `${client.FirstName} ${client.LastName}`.trim(),
-        email: client.Email || null,
-        clientId: String(client.Id),
-      };
-    }
-    return { found: false };
+    client = await mindbodyService.getClientByPhone(from, null);
   } catch (err) {
     logger.warn('lookup_client error:', err.message);
-    return { found: false };
+    return {
+      found: false,
+      lookup_failed: true,
+      message: 'Our booking system did not answer, so we could not check whether this customer is already known. Do NOT tell the customer they are new or unknown. Continue with the confirmation summary using the name you have; book_appointment checks again and tells you (email_required) if a name or email address is still needed.',
+    };
   }
+  if (!client && stored?.mindbody_client_id) client = await clientByStoredId(stored);
+  if (client) {
+    const email = (await profileEmailOf(from, client, storedEmail)) || storedEmail;
+    const known = { found: true, name: profileNameOf(client), email, clientId: String(client.Id) };
+    if (email) return { ...known, email_on_file: true };
+    return {
+      ...known,
+      needs_email: true,
+      message: 'We know this guest but have no real email address for them. Before the confirmation summary, ask for their email address (ui_type "none"), e.g. "Could you share your email address? We use it for your booking confirmation and to reach you if anything changes." Only use an address the customer types - never invent one. When they have typed it, pass it as client_email to book_appointment / book_class, copied exactly: the server has no address for this guest, so do not leave client_email out.',
+    };
+  }
+  // No profile by phone or by the stored id, but this number gave us an address
+  // before (the team merged or removed the profile since — which is what our
+  // notice asks them to do). The booking tool finds the profile by that
+  // address, or makes a new one with it and asks for a full name itself if it
+  // needs one; "a new guest, ask name and email" here contradicted it.
+  if (storedEmail) {
+    const name = stored?.full_name || null;
+    return {
+      found: true,
+      name,
+      email: storedEmail,
+      email_on_file: true,
+      message: isFullName(name) ? 'Returning guest - name and email are on file. Do NOT ask for them again.' : 'Returning guest - their email address is on file. Do NOT ask for it again.',
+    };
+  }
+  return newGuest;
 }
 
 // Append a real booking to the per-conversation pending list so send_payment
@@ -694,9 +803,14 @@ function lettersOf(s) {
 function firstNameOf(fullName) {
   return lettersOf(String(fullName || '').trim().split(/\s+/)[0]);
 }
-/** Everything after the first name, letters only ("Gina van Spall" → "vanspall"). */
+/**
+ * Everything after the first name, letters only ("Gina van Spall" → "vanspall").
+ * A surname the bot itself once wrote ("Touriya WhatsApp") is not a surname:
+ * it says nothing about who someone is.
+ */
 function surnameOf(fullName) {
-  return lettersOf(String(fullName || '').trim().split(/\s+/).slice(1).join(''));
+  const rest = String(fullName || '').trim().split(/\s+/).slice(1).join('');
+  return isBotSurname(rest) ? '' : lettersOf(rest);
 }
 /** Same first name, or one is the initial of the other. */
 function sameFirstName(a, b) {
@@ -735,7 +849,11 @@ function isOtherPerson(ownerClient, clientName, clientEmail, chatName = null) {
   if (sameEmail(clientEmail, ownerClient?.Email)) return false;
   if (sameFirstName(a, b)) {
     const ls = surnameOf(clientName);
-    const lo = lettersOf(ownerClient?.LastName);
+    // Touriya review, Nov 2026: on her profile "Touriya WhatsApp" the model
+    // passed her real full name with the address she had just typed — "two
+    // people called Touriya", so she got yet another profile (without her
+    // number) and was asked for her address again at every visit.
+    const lo = isBotSurname(ownerClient?.LastName) ? '' : lettersOf(ownerClient?.LastName);
     return !!(clientEmail && ownerClient?.Email && ls && lo && !ls.includes(lo) && !lo.includes(ls));
   }
   const c = firstNameOf(chatName);
@@ -743,12 +861,457 @@ function isOtherPerson(ownerClient, clientName, clientEmail, chatName = null) {
   return true;
 }
 
+// ---- The guest's real email address ----
+// Touriya, 27 Sep 2026: book_appointment was called with only a first name and
+// an address nobody had typed — the model made it up because the tool demanded
+// one — and a Mindbody profile "Touriya WhatsApp" was created with it. When
+// her payment failed the team could not email her. Since then the model's
+// word is never enough: an address only counts when it is well-formed, not
+// reserved, and typed by the guest in this chat, on their own Mindbody
+// profile, or stored for their number from an earlier booking
+// (guest_contacts). Every check here fails soft: a database error reads as
+// "nothing stored / nothing typed" and the guest is simply asked.
+
+const isWebSession = (from) => String(from).startsWith('web_');
+
+/** Our own mailboxes — they are all over the prompt, so the first address a model grabs. */
+function teamAddresses() {
+  try {
+    return [...Object.values(settings.contact()?.emails || {}), settings.teamInbox()].filter(Boolean);
+  } catch (_) {
+    return [];
+  }
+}
+
+/** The cleaned address when it is well-formed and not reserved, else null. */
+function usableEmail(email) {
+  return guestEmail.isUsable(email, teamAddresses()) ? guestEmail.clean(email) : null;
+}
+
+/** A surname the bot itself wrote when a guest gave one word ("Touriya WhatsApp"). */
+function isBotSurname(lastName) {
+  return ['whatsapp', 'web', '-'].includes(String(lastName || '').trim().toLowerCase());
+}
+
+/** A first AND a last name — and not a surname the bot once made up. */
+function isFullName(name) {
+  const rest = String(name || '').trim().split(/\s+/).slice(1).join(' ');
+  return !!firstNameOf(name) && !!lettersOf(rest) && !isBotSurname(rest);
+}
+
+/** A profile's name as the guest would give it (without a made-up surname). */
+function profileNameOf(client) {
+  return `${client?.FirstName || ''} ${isBotSurname(client?.LastName) ? '' : (client?.LastName || '')}`.trim();
+}
+
+/**
+ * What this number gave us at an earlier booking (guest_contacts), or null.
+ * Never for the website chat: a session is not a person we can remember.
+ */
+async function storedContact(from) {
+  if (isWebSession(from)) return null;
+  try {
+    return (await db.getGuestContact?.(from)) || null;
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
+ * Did the guest type this address in this chat? Memory first (the message
+ * being handled is written to the database without waiting for it), then
+ * their stored messages — guests come back days after the 30-minute memory
+ * is gone.
+ */
+async function typedInChat(from, email) {
+  const inMemory = conversationService.getMessages(from)
+    // "__RESUME__ …" is the team handing the chat back, not the guest's words.
+    .filter(m => m.role === 'user' && !String(m.content).startsWith('__RESUME__'))
+    .map(m => m.content);
+  if (guestEmail.typedByGuest(email, inMemory)) return true;
+  let stored = [];
+  try {
+    stored = (await db.getGuestTypedTexts?.(from)) || [];
+  } catch (_) {
+    stored = [];
+  }
+  return guestEmail.typedByGuest(email, stored);
+}
+
+/**
+ * May the address the model passed be used for this guest? Only when the
+ * guest typed it, or it equals an address we already trust (`trusted`: the one
+ * on their profile, the one stored for their number).
+ * @returns {Promise<{ok:true,email:string}|{ok:false,reason:'missing'|'invalid'|'placeholder'|'not_from_guest',given:string|null}>}
+ */
+async function vetGuestEmail(from, email, trusted = []) {
+  const e = guestEmail.clean(email);
+  if (!e) return { ok: false, reason: 'missing', given: null };
+  if (!guestEmail.isWellFormed(e)) return { ok: false, reason: 'invalid', given: e };
+  if (guestEmail.isReserved(e, teamAddresses())) return { ok: false, reason: 'placeholder', given: e };
+  if (trusted.some(t => sameEmail(t, e))) return { ok: true, email: e };
+  if (await typedInChat(from, e)) return { ok: true, email: e };
+  return { ok: false, reason: 'not_from_guest', given: e };
+}
+
+/**
+ * The email address on a Mindbody profile when it can be trusted, else null.
+ * Search results can leave Email out, so the full profile is read before
+ * anyone is asked. On a profile the bot once made from a one-word name
+ * (surname WhatsApp / Web / -) an address only counts when the guest typed it
+ * or it is the one stored for them: that is where invented addresses sit, and
+ * no list of placeholders recognises "firstname@gmail.com".
+ * `read.failed` is set when the full profile could not be read, or the answer
+ * was not this profile: the guest is asked all the same (nothing is assumed),
+ * but that is not "this profile has no address" — the team is not told so.
+ */
+async function profileEmailOf(from, client, storedEmail = null, read = {}) {
+  let email = guestEmail.clean(client?.Email);
+  if (!email && client?.Id != null) {
+    let full = null;
+    try {
+      full = await mindbodyService.getClientById(client.Id);
+    } catch (_) {
+      full = null;
+    }
+    // Only this profile's own answer counts — never another client's address.
+    if (full && String(full.Id) === String(client.Id)) email = guestEmail.clean(full.Email);
+    else read.failed = true;
+  }
+  const usable = usableEmail(email);
+  if (!usable) return null;
+  if (isBotSurname(client.LastName) && !sameEmail(usable, storedEmail) && !(await typedInChat(from, usable))) return null;
+  return usable;
+}
+
+/**
+ * The profile this number booked on before — used only while it still exists,
+ * is active and carries the same first name (profiles get merged and removed).
+ */
+async function clientByStoredId(stored) {
+  try {
+    const client = await mindbodyService.getClientById(stored.mindbody_client_id);
+    if (!client || client.Active === false) return null;
+    if (String(client.Id) !== String(stored.mindbody_client_id)) return null;
+    if (stored.full_name && !sameFirstName(firstNameOf(stored.full_name), firstNameOf(client.FirstName))) return null;
+    return client;
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
+ * Website chat: the phone number the model passes counts only when the
+ * visitor typed it (its last nine digits stand in a message of theirs) — the
+ * same rule as for the email address. An invented number can match a
+ * stranger's Mindbody profile. "web_<session>" itself is never a number.
+ */
+function typedPhone(from, phone) {
+  const digits = String(phone || '').replace(/\D/g, '');
+  if (digits.length < 9) return null;
+  const tail = digits.slice(-9);
+  const typed = conversationService.getMessages(from)
+    .some(m => m.role === 'user' && String(m.content).replace(/\D/g, '').includes(tail));
+  return typed ? String(phone).trim() : null;
+}
+
+// One word of a name: letters, with - ' . inside ("Jan-Willem", "O'Brien").
+const NAME_WORD = /^\p{L}[\p{L}\p{M}'’.-]*$/u;
+
+/**
+ * The first and last name for a NEW profile, or null. The name the model
+ * passed when it has both; a one-word name is completed only from what the
+ * guest gave us themselves — the name stored for their number or their
+ * WhatsApp name — and only when the first name matches.
+ * A WhatsApp name is free text ("Touriya 🌸 Fixture", "Touriya | Coach",
+ * "T Fixture"): it only supplies the SURNAME, and only when every word of it
+ * reads as a name. Taken whole it wrote "🌸 Fixture" and "| Coach" into
+ * Mindbody as surnames — the same family as "WhatsApp".
+ */
+function newProfileName(clientName, stored, chatName) {
+  if (isFullName(clientName)) return String(clientName).trim();
+  const first = firstNameOf(clientName);
+  if (isFullName(stored?.full_name) && (!first || sameFirstName(first, firstNameOf(stored.full_name)))) return String(stored.full_name).trim();
+  const chatWords = String(chatName || '').trim().split(/\s+/);
+  if (first && isFullName(chatName) && sameFirstName(first, firstNameOf(chatName))
+    && chatWords.every(w => NAME_WORD.test(w)) && lettersOf(chatWords[chatWords.length - 1]).length >= 2) {
+    // The first name stays the one the guest gave, unless that is the initial.
+    const given = String(clientName).trim().split(/\s+/)[0];
+    const firstWord = lettersOf(given).length >= lettersOf(chatWords[0]).length ? given : chatWords[0];
+    return `${firstWord} ${chatWords.slice(1).join(' ')}`;
+  }
+  return null;
+}
+
+const EMAIL_REFUSAL_WHY = {
+  missing: () => 'We have no email address for this guest.',
+  invalid: (given) => `"${given}" is not a complete email address.`,
+  placeholder: (given) => `"${given}" is not a real address of this guest.`,
+  not_from_guest: (given) => `"${given}" was not typed by the customer in this chat.`,
+};
+const NO_FULL_NAME = 'A new guest needs a first and last name, as the customer gives it - never make up a surname.';
+const NO_SURNAME_HANDOFF = 'No full name - book by hand:';
+// The agent loop lets ONE corrected booking call through after a refusal (see
+// emailRefusal there) — for a guest who had typed it and the model left it out.
+const RETRY_ONLY_IF_TYPED = ' — unless the customer has ALREADY typed it in this chat and you left it out or changed it: then call once more with it copied exactly.';
+
+/**
+ * The one refusal for a missing email address or name: nothing was booked,
+ * nothing was created, and the model is told exactly what to ask — it has no
+ * reason left to make something up or to keep trying.
+ * No "asked before?" state: whether a guest declined is for the model to
+ * judge, and a wrong call costs one extra question.
+ */
+function emailRequired(from, { tool, vetted, needEmail = true, needName = false }) {
+  const given = String(vetted?.given || '').slice(0, 100);
+  const again = `call ${tool} again with the same ${tool === 'book_class' ? 'class' : 'treatment and time'}`;
+  if (!needEmail) {
+    // Not a dead end either: some guests have one name, or keep their surname.
+    const noSurname = isWebSession(from)
+      ? 'If the visitor has only one name or does not want to give a surname, do not ask again and do not book: point them to renessence.com/booking.'
+      : `If the customer was already asked in this chat and has only one name or does not want to give a surname, do not ask again and do not book: tell them our team will arrange the booking here in the chat and call request_human_handoff with a reason starting "${NO_SURNAME_HANDOFF}" followed by name, treatment, date and time.`;
+    return {
+      error: 'email_required',
+      reason: 'name_missing',
+      need_name: true,
+      nothing_booked: true,
+      message: `NOTHING was booked and no profile was created. ${NO_FULL_NAME} Ask them now, in their language (ui_type "none"), for their full name (first and last name). Do NOT call ${tool} again in this turn${RETRY_ONLY_IF_TYPED} When they have typed it, ${again} and that client_name. ${noSurname}`,
+    };
+  }
+  const reason = vetted?.reason || 'missing';
+  const declined = isWebSession(from)
+    ? 'If the visitor does not want to share an email address, do not book: point them to renessence.com/booking.'
+    : 'If the customer was already asked in this chat and does not want to share an email address, do not ask again and do not book: tell them our team will arrange the booking here in the chat and call request_human_handoff with a reason starting "No email - book by hand:" followed by name, treatment, date and time.';
+  return {
+    error: 'email_required',
+    reason,
+    ...(needName ? { need_name: true } : {}),
+    nothing_booked: true,
+    message: `NOTHING was booked and no profile was created. ${EMAIL_REFUSAL_WHY[reason](given)} We need this guest's own email address${needName ? ' and full name (first and last name)' : ''}, typed by the customer in this chat - never invent, guess, complete or correct one. Ask them now, in their language (ui_type "none"), for example: "Before I book this for you: could you type your ${needName ? 'full name and ' : ''}email address? We use it for your confirmation and to reach you if anything changes." Do NOT call ${tool} again in this turn${RETRY_ONLY_IF_TYPED} When they have typed it, ${again} and that address copied exactly. ${declined}`,
+  };
+}
+
+/** The same refusal for a second person in the chat (a friend, a partner). */
+function companionRequired(clientName, { vetted, needEmail = true }) {
+  const given = String(vetted?.given || '').slice(0, 100);
+  if (!needEmail) {
+    return {
+      error: 'companion_email_required',
+      reason: 'name_missing',
+      need_name: true,
+      nothing_booked: true,
+      message: `NOTHING was booked for ${clientName} and no profile was created. ${NO_FULL_NAME} Ask for ${clientName}'s full name (first and last name). Do NOT call book_appointment for ${clientName} again in this turn${RETRY_ONLY_IF_TYPED} When the customer has typed it, call book_appointment again with that client_name and the same client_email. If the customer was already asked and ${clientName} has only one name or they do not want to give the surname, do not ask again and do not book for ${clientName}: tell them our team will arrange it and call request_human_handoff with a reason starting "${NO_SURNAME_HANDOFF}" followed by both names, treatment, date and time.`,
+    };
+  }
+  const reason = vetted?.reason || 'missing';
+  return {
+    error: 'companion_email_required',
+    reason,
+    nothing_booked: true,
+    message: `NOTHING was booked for ${clientName}. ${EMAIL_REFUSAL_WHY[reason](given).replace('this guest', () => clientName)} Each guest gets their own booking and we need THEIR own email address, typed by the customer in this chat - never invent one. Ask for it (if the customer wants one address for both guests they can say so, and you pass the chat owner's own address). Do NOT call book_appointment for ${clientName} again in this turn${RETRY_ONLY_IF_TYPED} When the customer has typed it, call book_appointment again with client_name and client_email of ${clientName}.`,
+  };
+}
+
+// What the guest is asked when a turn ends on that refusal without a reply
+// (agent loop): the question the model should have asked — it used to be
+// "No availability was found", which answers something nobody asked.
+const EMAIL_QUESTIONS = {
+  en: {
+    email: 'Before I can book this for you, I need your email address — could you type it here? We use it for your confirmation and to reach you if anything changes.',
+    nameAndEmail: 'Before I can book this for you, I need your full name and email address — could you type them here? We use them for your confirmation and to reach you if anything changes.',
+    name: 'Before I can book this for you, I need your full name (first and last name) — could you type it here?',
+    companion: 'Before I can book this for your guest, I need their full name and their own email address — could you type them here? Each guest gets their own booking.',
+  },
+  nl: {
+    email: 'Voordat ik dit voor je kan boeken, heb ik je e-mailadres nodig — wil je het hier typen? We gebruiken het voor je bevestiging en om je te bereiken als er iets verandert.',
+    nameAndEmail: 'Voordat ik dit voor je kan boeken, heb ik je volledige naam en e-mailadres nodig — wil je die hier typen? We gebruiken ze voor je bevestiging en om je te bereiken als er iets verandert.',
+    name: 'Voordat ik dit voor je kan boeken, heb ik je volledige naam nodig (voor- en achternaam) — wil je die hier typen?',
+    companion: 'Voordat ik dit voor je gast kan boeken, heb ik de volledige naam en het eigen e-mailadres van je gast nodig — wil je die hier typen? Elke gast krijgt een eigen boeking.',
+  },
+};
+function emailQuestion(lang, refusal) {
+  const texts = EMAIL_QUESTIONS[lang === 'nl' ? 'nl' : 'en'];
+  if (refusal?.error === 'companion_email_required') return texts.companion;
+  if (refusal?.reason === 'name_missing') return texts.name;
+  return refusal?.need_name ? texts.nameAndEmail : texts.email;
+}
+
+/**
+ * Who is this booking for, and on which Mindbody profile? Shared by
+ * book_appointment and book_class. In order:
+ *  1. the phone lookup — WITHOUT the model's email: an address nobody checked
+ *     is not even searched in Mindbody (it can match a stranger's profile).
+ *     Not in the website chat: there is no number to trust there;
+ *  2. the profile this number booked on before (guest_contacts): a profile
+ *     found by email does not carry the WhatsApp number, so at the next visit
+ *     the phone lookup misses it (the likely origin of her second profile);
+ *  3. the email search, only with a vetted or stored address;
+ *  4. a NEW profile: only with a first and last name and such an address
+ *     (else email_required), and for book_appointment only after the Confirm
+ *     tap (else confirmation_required) — a profile used to be created before
+ *     the Confirm gate was even looked at. book_class has no Confirm gate.
+ * Returns { refusal }, or { client, email, vetted, profileEmail, profileUnread,
+ * storedEmail, foundByPhone, forSomeoneElse }: `email` is the model's address
+ * when it passed the check (else null), `profileEmail` the profile's own
+ * usable one, `profileUnread` that the profile's address could not be read.
+ */
+async function resolveBookingGuest(from, { client_name, client_email, client_phone, tool, stored }) {
+  const isWeb = isWebSession(from);
+  const storedEmail = usableEmail(stored?.email);
+  // Website chat: a visitor is found by the email they typed, never by a phone
+  // number. A typed number can be anyone's — a class landed on that person's
+  // profile and Stripe showed their address (review, Nov 2026). The number
+  // only goes on a NEW profile.
+  const newProfilePhone = isWeb ? typedPhone(from, client_phone) : from;
+
+  let client = isWeb ? null : await mindbodyService.getClientByPhone(from, null);
+  const foundByPhone = !!client;
+  if (!client && stored?.mindbody_client_id) client = await clientByStoredId(stored);
+
+  const read = {};
+  let profileEmail = client ? await profileEmailOf(from, client, storedEmail, read) : null;
+  const vetted = await vetGuestEmail(from, client_email, [profileEmail, storedEmail]);
+  const email = vetted.ok ? vetted.email : null;
+
+  if (!client && (email || storedEmail)) {
+    client = await mindbodyService.searchClientByEmail(email || storedEmail);
+    // The search only returns a profile that carries exactly this address.
+    if (client) profileEmail = email || storedEmail;
+  }
+
+  let forSomeoneElse = false;
+  if (!client) {
+    const chatOwnerName = conversationService.get(from)?.userName || null;
+    const fullName = newProfileName(client_name, stored, chatOwnerName);
+    // The stored address is the chat owner's. It goes on a new profile only
+    // for the owner (no name given, or a first name that is theirs): a first
+    // call for a friend used to make the friend's profile with it.
+    const first = firstNameOf(client_name);
+    const storedIsTheirs = !first || [stored?.full_name, chatOwnerName].some(n => !!firstNameOf(n) && sameFirstName(first, firstNameOf(n)));
+    const newEmail = email || (storedIsTheirs ? storedEmail : null);
+    if (!fullName || !newEmail) {
+      return { refusal: emailRequired(from, { tool, vetted, needEmail: !newEmail, needName: !fullName }) };
+    }
+    if (isWeb && tool === 'book_appointment' && !newProfilePhone) {
+      return { refusal: { error: 'client_phone_required', message: 'Need phone number to create account. Ask the visitor to type it - only a number they typed in this chat counts, never fill one in yourself.' } };
+    }
+    if (tool === 'book_appointment' && !confirmedRecently(from)) return { refusal: CONFIRMATION_REQUIRED };
+    const parts = fullName.split(/\s+/);
+    // A new number booking only for someone ELSE (the friend's call came
+    // first, or a gift): their profile must not carry the chat owner's phone.
+    // Only on a clear signal: the WhatsApp name has a surname and it differs
+    // from the guest's surname. A nickname ("Liz" booking as "Elizabeth
+    // Jansen") or a first-name-only WhatsApp name keeps the phone.
+    // book_appointment only, as before: a class has no second person, and a
+    // class profile without the number cannot be found by the unpaid-class
+    // release or the reminders (both look guests up by phone).
+    const ownerLast = surnameOf(chatOwnerName);
+    const guestLast = surnameOf(fullName);
+    forSomeoneElse = tool === 'book_appointment' && !isWeb && !!chatOwnerName && !!ownerLast && !!guestLast
+      && !ownerLast.includes(guestLast) && !guestLast.includes(ownerLast)
+      && isOtherPerson({ FirstName: chatOwnerName }, fullName, null);
+    try {
+      client = await mindbodyService.addClient({ firstName: parts[0], lastName: parts.slice(1).join(' '), email: newEmail, mobilePhone: forSomeoneElse ? null : newProfilePhone, city: 'Amsterdam' });
+    } catch (addErr) {
+      if (addErr.response?.data?.Error?.Code === 'InvalidClientCreation') {
+        client = isWeb
+          ? await mindbodyService.searchClientByEmail(newEmail)
+          : await mindbodyService.getClientByPhone(from, newEmail);
+        if (!client) throw addErr;
+      } else throw addErr;
+    }
+    profileEmail = newEmail;
+  }
+  return { client, email, vetted, profileEmail, profileUnread: !!read.failed, storedEmail, foundByPhone, forSomeoneElse };
+}
+
+/**
+ * After a booking for the chat owner went through: remember what this number
+ * gave us, and tell the team when the Mindbody profile itself still has no
+ * real address. Best-effort: it never throws, and only the small database
+ * write is waited for (the team's mail is not) — it must never break or hold
+ * up the guest's reply.
+ */
+async function afterOwnBooking(from, { client, clientName, guest, email }) {
+  if (!email) return;
+  // Only the chat owner's own booking. book_class has no second-person
+  // handling: a class "for my friend Nadia" on the owner's profile stored
+  // Nadia's name and address as the owner's, and mailed the team to put
+  // Nadia's address on the owner's profile (review, Nov 2026).
+  if (clientName && isOtherPerson(client, clientName, null, conversationService.get(from)?.userName || null)) return;
+  // Written before the tool answers: the next booking call of the same turn (a
+  // journey) reads it. Not waited for, that call asked for the address again.
+  await rememberGuest(from, { client, clientName, guest, email });
+  // A profile whose address could not be READ is not a profile without one.
+  // The team's mail is not waited for.
+  if (!guest.profileEmail && !guest.profileUnread) notifyProfileWithoutEmail(from, client, email);
+}
+
+/**
+ * Store email, full name and Mindbody profile for this number. Only the chat
+ * owner's own: the profile was found by this number, or the booking is under
+ * the name they use on WhatsApp — a first booking made for a friend must not
+ * become "the owner's" contact. Never for the website chat.
+ */
+async function rememberGuest(from, { client, clientName, guest, email }) {
+  if (isWebSession(from)) return;
+  const chatFirst = firstNameOf(conversationService.get(from)?.userName);
+  const bookedFirst = firstNameOf(clientName || client.FirstName);
+  if (!guest.foundByPhone && !(chatFirst && bookedFirst && sameFirstName(bookedFirst, chatFirst))) return;
+  const fullName = (isFullName(clientName) ? String(clientName).trim() : profileNameOf(client)) || null;
+  try {
+    await db.saveGuestContact?.(from, { email, fullName, mindbodyClientId: String(client.Id) });
+  } catch (_) { /* best-effort: the booking stands either way */ }
+}
+
+/**
+ * Team decision (Touriya, 27 Sep 2026): the bot does not rewrite existing
+ * Mindbody profiles — that call was never tried on this site and can leave
+ * two profiles with one address. The address goes into the appointment note
+ * and the team is told once a week per number, like duplicate profiles.
+ */
+async function notifyProfileWithoutEmail(from, client, email) {
+  try {
+    if (await db.hasRecentTeamNotification?.(from, 'profile_without_email', 7 * 24 * 60)) return;
+    const name = `${client.FirstName || ''} ${client.LastName || ''}`.trim() || 'unnamed';
+    const message = `Mindbody profile ${client.Id} (${name}) has no real email address. The guest gave: ${email}. Please update or merge the profile.`;
+    await db.logEscalation?.(from, name, 'profile_without_email', message);
+    await emailService.sendEscalationEmail({ customerName: name, customerPhone: from, customerEmail: email, message });
+  } catch (err) {
+    logger.warn('Profile-without-email notice failed:', err.message);
+  }
+}
+
+/**
+ * The address the team or Stripe may be given for this guest: the one the
+ * model passed when the guest really typed it (or we already trust it), else
+ * the one we have for them, else none. An invented address is dropped, never
+ * forwarded — and never a reason to hold a WhatsApp handoff back.
+ */
+async function reachableEmail(from, given, alsoTrusted = null) {
+  try {
+    const trusted = [usableEmail(alsoTrusted), usableEmail((await storedContact(from))?.email)].filter(Boolean);
+    const vetted = await vetGuestEmail(from, given, trusted);
+    return vetted.ok ? vetted.email : (trusted[0] || null);
+  } catch (_) {
+    return null;
+  }
+}
+
+// What resolveCompanionClient answers when a NEW profile would be needed but
+// may not be created yet: only a first name is known (it used to get the
+// surname "-"), or the customer has not tapped Confirm.
+const NEEDS_FULL_NAME = Symbol('needs_full_name');
+const NEEDS_CONFIRM = Symbol('needs_confirm');
+
 /**
  * The second person's own Mindbody profile: found by email, or created with
  * their name and email (never with the chat owner's phone — that would tie
- * two people to one number). null when neither works.
+ * two people to one number). null when neither works. A profile that exists
+ * is used as before; a NEW one is only created with a first and last name
+ * (else NEEDS_FULL_NAME) and after the Confirm tap (else NEEDS_CONFIRM).
  */
-async function resolveCompanionClient(clientName, clientEmail) {
+async function resolveCompanionClient(clientName, clientEmail, { confirmed }) {
   try {
     const found = await mindbodyService.searchClientByEmail(clientEmail);
     // A shared/household email can belong to someone else (her mother's
@@ -757,9 +1320,11 @@ async function resolveCompanionClient(clientName, clientEmail) {
   } catch (err) {
     logger.warn('Companion lookup by email failed:', err.message);
   }
+  if (!isFullName(clientName)) return NEEDS_FULL_NAME;
+  if (!confirmed) return NEEDS_CONFIRM;
   const parts = String(clientName).trim().split(/\s+/);
   try {
-    const created = await mindbodyService.addClient({ firstName: parts[0], lastName: parts.slice(1).join(' ') || '-', email: clientEmail, mobilePhone: null, city: 'Amsterdam' });
+    const created = await mindbodyService.addClient({ firstName: parts[0], lastName: parts.slice(1).join(' '), email: clientEmail, mobilePhone: null, city: 'Amsterdam' });
     if (created?.Id) return created;
   } catch (err) {
     logger.warn('Companion profile could not be created:', err.response?.data?.Error?.Message || err.message);
@@ -805,7 +1370,7 @@ async function settleUnknownBooking(from, clientId, sessionTypeId, startDateTime
  * for it), then create the awaiting-payment row and its Stripe link. The
  * webhook books it once the payment is in.
  */
-async function bookPayFirst(from, { client, session_type_id, start_date_time, staff_id, client_name, client_email, notes, companionNote = null, replaceRows = null }) {
+async function bookPayFirst(from, { client, session_type_id, start_date_time, staff_id, client_name, client_email, notes, emailNote = null, companionNote = null, replaceRows = null }) {
   const sessionTypeId = Number(session_type_id);
   const startMs = new Date(start_date_time).getTime();
   if (!(startMs >= Date.now() + payFirstCfg.PAY_FIRST_BOOK_LEAD_MINUTES * 60000)) {
@@ -871,7 +1436,10 @@ async function bookPayFirst(from, { client, session_type_id, start_date_time, st
     const s = (staff || []).find(m => Number(m.Id) === staffId);
     staffName = s ? (s.DisplayName || s.Name || [s.FirstName, s.LastName].filter(Boolean).join(' ') || null) : null;
   } catch (_) { /* name is cosmetic */ }
-  const customerEmail = client_email || conversationService.get(from)?.customerEmail || client.Email || null;
+  // client_email is the address book_appointment settled on (typed by the
+  // guest, on their profile, or stored for their number). The profile's own
+  // address is not used blindly: it can be a placeholder (Touriya, 27 Sep 2026).
+  const customerEmail = client_email || conversationService.get(from)?.customerEmail || null;
   const customerName = client_name || `${client.FirstName || ''} ${client.LastName || ''}`.trim() || null;
 
   // Replacing an earlier unpaid link: close it only now that the new time
@@ -897,6 +1465,7 @@ async function bookPayFirst(from, { client, session_type_id, start_date_time, st
     roomId: pick.roomId,
     notes: notes || null,
     forNote: companionNote,
+    emailNote,
     amountCents,
     lang,
   });
@@ -926,6 +1495,25 @@ async function bookPayFirst(from, { client, session_type_id, start_date_time, st
   };
 }
 
+// The order of the checks (Touriya, 27 Sep 2026 — a Mindbody profile was
+// created with an invented address, and before she had confirmed anything):
+//   discontinued / paused / closed → skip_payment bounce
+//   → pay-first: what does this guest already have (guardExisting)
+//   → who is the guest (resolveBookingGuest): phone, then the profile stored
+//     for this number, then a vetted email; a NEW profile needs a full name
+//     and a vetted address (email_required), then the Confirm tap
+//     (confirmation_required), and only then is it created
+//   → a second person in the chat (their own vetted address; no profile
+//     before the Confirm tap)
+//   → a repeat of a booking that exists (already booked / already paid —
+//     never held up by a missing address)
+//   → an existing profile without a real address and none typed or stored
+//     (email_required)
+//   → journey size → Confirm gate → offered-slot gate → the day the guest
+//     confirmed (Melanie, 23 Nov 2026: the summary she confirmed named another
+//     day than the slot that was booked; confirmed_day_differs) → the booking.
+// From the guest lookup on, client_email is the address that passed the check
+// or null — never the model's word.
 async function toolBookAppointment(from, { session_type_id, start_date_time, staff_id, client_name, client_email, notes, skip_payment, defer_payment, client_phone, replace_pending_payment, keep_pending_payment }) {
   // Discontinued treatments can never be booked, whatever the model was told.
   if (DISCONTINUED_SESSION_TYPES.has(Number(session_type_id))) {
@@ -955,6 +1543,9 @@ async function toolBookAppointment(from, { session_type_id, start_date_time, sta
     };
   }
 
+  // What this number gave us at an earlier booking (never throws).
+  const stored = await storedContact(from);
+
   // Pay-first treatments: what does this guest already have? Runs BEFORE the
   // journey and Confirm gates — re-sharing a link or answering "did my payment
   // go through?" must never need a new confirmation or go to the team, and a
@@ -968,7 +1559,24 @@ async function toolBookAppointment(from, { session_type_id, start_date_time, sta
         message: 'Massages, facials, Nervous System Reset and Let It Go are paid online before booking, which works through our WhatsApp assistant or on our website — not in this chat. Point the customer to the booking page renessence.com/booking (or our WhatsApp, if they already have the number).',
       };
     }
-    const guard = await payFirst.guardExisting(from, session_type_id, start_date_time, { replacePending: !!replace_pending_payment, keepPending: !!keep_pending_payment, clientName: client_name || null, clientEmail: client_email || null });
+    // The guard only compares the address with this guest's own open links;
+    // it too gets one the guest typed or we already hold for them (stored for
+    // the number, or settled by an earlier booking in this chat) — never the
+    // model's word.
+    const guardVetted = await vetGuestEmail(from, client_email, [usableEmail(stored?.email), usableEmail(conversationService.get(from)?.customerEmail)]);
+    let guardEmail = guardVetted.ok ? guardVetted.email : null;
+    if (!guardEmail && guestEmail.clean(client_email)) {
+      // A link made or paid before addresses were checked (Nov 2026) has
+      // nothing typed or stored behind it — but its own row carries the
+      // address the server used then, and the guard compares with exactly
+      // those rows. Without this the owner under her WhatsApp nickname was
+      // told "a second guest, the team arranges it" for a massage she had paid.
+      const given = guestEmail.clean(client_email);
+      let ownRows = [];
+      try { ownRows = (await db.getPayFirstRowsForPhone?.(from)) || []; } catch (_) { ownRows = []; }
+      if (ownRows.some(r => sameEmail(r.pay_first?.customerEmail, given))) guardEmail = given;
+    }
+    const guard = await payFirst.guardExisting(from, session_type_id, start_date_time, { replacePending: !!replace_pending_payment, keepPending: !!keep_pending_payment, clientName: client_name || null, clientEmail: guardEmail });
     if (guard?.reshare) {
       const lang = conversationService.get(from)?.lang || 'en';
       conversationService.set(from, {
@@ -987,38 +1595,15 @@ async function toolBookAppointment(from, { session_type_id, start_date_time, sta
   }
 
   // 1. Find or create client
-  const phoneForLookup = from.startsWith('web_') ? (client_phone || null) : from;
-  let client = phoneForLookup ? await mindbodyService.getClientByPhone(phoneForLookup, client_email || null) : null;
-  if (!client) {
-    if (!client_name || !client_email) {
-      return { error: 'client_info_required', message: 'Need full name and email to create account.' };
-    }
-    if (from.startsWith('web_') && !client_phone) {
-      return { error: 'client_phone_required', message: 'Need phone number to create account.' };
-    }
-    const parts = client_name.trim().split(' ');
-    const firstName = parts[0];
-    const lastName = parts.slice(1).join(' ') || (from.startsWith('web_') ? 'Web' : 'WhatsApp');
-    // A new number booking only for someone ELSE (the friend's call came
-    // first, or a gift): their profile must not carry the chat owner's phone.
-    // Only on a clear signal: the WhatsApp name has a surname and it differs
-    // from the guest's surname. A nickname ("Liz" booking as "Elizabeth
-    // Jansen") or a first-name-only WhatsApp name keeps the phone.
-    const chatOwnerName = conversationService.get(from)?.userName || null;
-    const ownerLast = surnameOf(chatOwnerName);
-    const guestLast = surnameOf(client_name);
-    const forSomeoneElse = !from.startsWith('web_') && !!chatOwnerName && !!ownerLast && !!guestLast
-      && !ownerLast.includes(guestLast) && !guestLast.includes(ownerLast)
-      && isOtherPerson({ FirstName: chatOwnerName }, client_name, null);
-    try {
-      client = await mindbodyService.addClient({ firstName, lastName, email: client_email, mobilePhone: forSomeoneElse ? null : (phoneForLookup || from), city: 'Amsterdam' });
-    } catch (addErr) {
-      if (addErr.response?.data?.Error?.Code === 'InvalidClientCreation') {
-        client = await mindbodyService.getClientByPhone(from, client_email);
-        if (!client) throw addErr;
-      } else throw addErr;
-    }
-  }
+  const guest = await resolveBookingGuest(from, { client_name, client_email, client_phone, tool: 'book_appointment', stored });
+  if (guest.refusal) return guest.refusal;
+  let client = guest.client;
+  // From here on client_email is the address that passed the check, or null.
+  // Whether the booking is for someone else is decided on that one too: an
+  // address nobody typed counts as not given. Decided on the address as the
+  // model sent it, a returning guest was asked for "THEIR own email" when the
+  // model added another surname and a made-up address (review, Nov 2026).
+  client_email = guest.email;
 
   // Booking for SOMEONE ELSE in the same chat (a friend, a partner): they get
   // their own booking on their own Mindbody profile. Before this, every
@@ -1027,18 +1612,28 @@ async function toolBookAppointment(from, { session_type_id, start_date_time, sta
   // person's bookings silently vanished while the bot said they were made
   // (Gina & Nathalie, Oct 2026).
   let companionNote = null;
+  let onCompanionProfile = false;
   const chatName = conversationService.get(from)?.userName || null;
-  if (client && client_name && client_email && sameEmail(client_email, client.Email) && isOtherPerson(client, client_name, null, chatName)) {
+  // The owner's own address: the one on their profile, or — when the profile
+  // has none we trust — the one stored for their number. Compared with the
+  // profile alone, a friend got a NEW profile carrying the owner's stored
+  // address (review, Nov 2026).
+  const ownersEmail = !!client_email && [client?.Email, guest.profileEmail, guest.storedEmail].some(own => sameEmail(own, client_email));
+  if (client && client_name && ownersEmail) {
     // Someone else, but with the owner's email ("use my email for her"): an
     // own profile can't be made — book on the owner's profile, clearly marked.
-    companionNote = `For: ${client_name}`;
+    // The owner's own name with the owner's email is simply the owner.
+    if (isOtherPerson(client, client_name, null, chatName)) companionNote = `For: ${client_name}`;
   } else if (client && client_name && isOtherPerson(client, client_name, client_email, chatName)) {
-    if (!client_email) {
-      return { error: 'companion_email_required', message: `To book for ${client_name} we need THEIR email address (they get their own booking). Ask for it, then call book_appointment again with client_name and client_email of ${client_name}.` };
-    }
-    const companion = await resolveCompanionClient(client_name, client_email);
+    // No address that passed the check: nothing can be booked for them yet.
+    if (!client_email) return companionRequired(client_name, { vetted: guest.vetted });
+    const companion = await resolveCompanionClient(client_name, client_email, { confirmed: confirmedRecently(from) });
+    if (companion === NEEDS_FULL_NAME) return companionRequired(client_name, { needEmail: false });
+    // No NEW profile for the second person before the Confirm tap either.
+    if (companion === NEEDS_CONFIRM) return CONFIRMATION_REQUIRED;
     if (companion) {
       client = companion;
+      onCompanionProfile = true;
     } else {
       // Their profile couldn't be found or created: book on the chat owner's
       // profile, clearly marked for the front desk.
@@ -1061,10 +1656,15 @@ async function toolBookAppointment(from, { session_type_id, start_date_time, sta
     if (existingBooking && existingBooking.mindbody_appointment_id) {
       logger.info('Idempotent book_appointment: reusing existing booking', existingBooking.mindbody_appointment_id);
       const priceCentsX = paymentService.getPriceInCents(session_type_id);
-      const dateLabelX = formatDutchDate(start_date_time);
       const timeLabelX = formatDutchTime(start_date_time);
       const langX = conversationService.get(from)?.lang || 'en';
+      // What the model reads follows the chat language (Melanie, 23 Nov 2026:
+      // an English chat got "woensdag 25 november at 12:00" and the model
+      // wrote the day itself). The cart label ends up on the Stripe line item
+      // and keeps the form it always had.
+      const dateLabelX = dayLabel(start_date_time, langX);
       const dateTimeLabelX = `${dateLabelX} ${langX === 'nl' ? 'om' : 'at'} ${timeLabelX}`;
+      const cartLabelX = `${formatDutchDate(start_date_time)} ${langX === 'nl' ? 'om' : 'at'} ${timeLabelX}`;
       const serviceNameX = getServiceName(session_type_id);
 
       // What happens next depends on how far the ORIGINAL booking got. Blindly
@@ -1139,7 +1739,8 @@ async function toolBookAppointment(from, { session_type_id, start_date_time, sta
         appointment_id: existingBooking.mindbody_appointment_id,
         session_type_id,
         service_name: serviceNameX,
-        date_time_label: dateTimeLabelX,
+        date_time_label: cartLabelX,
+        when_label: dateTimeLabelX,
         amount_cents: priceCentsX,
       });
       scheduleAutoPaymentLink(from);
@@ -1152,6 +1753,36 @@ async function toolBookAppointment(from, { session_type_id, start_date_time, sta
       };
     }
   }
+
+  // A booking for the chat owner on a profile that has no real email address
+  // (empty, a placeholder, or the one an earlier version of the bot invented):
+  // book only with an address the guest typed or the one stored for their
+  // number. The profile itself is not rewritten (team decision): the address
+  // goes into the appointment note and the team is told after the booking.
+  // AFTER the repeat check above — "already booked / already paid" must never
+  // be held up by a missing address — and before the journey and Confirm
+  // gates, so the guest is asked before the confirmation, not after it.
+  const ownBooking = !companionNote && !onCompanionProfile;
+  let emailNote = null;
+  if (ownBooking && !guest.profileEmail) {
+    const given = client_email || guest.storedEmail;
+    if (!given) return emailRequired(from, { tool: 'book_appointment', vetted: guest.vetted });
+    emailNote = `Email: ${given}`;
+  }
+  // Where this booking's payment link and receipt go: only ever an address
+  // that passed the check, is on the profile, or is stored for this number.
+  const contactEmail = client_email || conversationService.get(from)?.customerEmail || guest.profileEmail || guest.storedEmail || null;
+  // Best-effort, once the booking (or its payment link) exists.
+  const bookedForOwner = async () => {
+    if (!ownBooking || guest.forSomeoneElse) return;
+    try {
+      // Remembered for the number: the profile's own address when it has one
+      // — another address typed in the chat can be a friend's.
+      await afterOwnBooking(from, { client, clientName: client_name, guest, email: guest.profileEmail || client_email || guest.storedEmail });
+    } catch (err) {
+      logger.warn('Remembering the guest after a booking failed:', err.message);
+    }
+  };
 
   // Journey cap: more than 3 treatments in one journey (one payment batch) is
   // arranged personally by the team, not auto-booked. If 3 are already in the
@@ -1212,14 +1843,7 @@ async function toolBookAppointment(from, { session_type_id, start_date_time, sta
   // no matter how the model behaves. Reschedules (skip_payment) are exempt:
   // they have their own confirmation in the reschedule flow.
   if (!skip_payment) {
-    const conf = conversationService.get(from)?.bookingConfirmedAt;
-    const confirmedRecently = conf && (Date.now() - conf) < 10 * 60 * 1000;
-    if (!confirmedRecently) {
-      return {
-        error: 'confirmation_required',
-        message: 'You have not received the customer\'s confirmation yet. This is NOT an error — do not tell the customer something went wrong. Before booking you MUST show the confirmation summary (every treatment for every person, date, time, name + the health and cancellation declaration) with Confirm/Cancel buttons (id "confirm_booking"), and only call book_appointment after the customer taps "Confirm". Show that confirmation now — do NOT book yet.',
-      };
-    }
+    if (!confirmedRecently(from)) return CONFIRMATION_REQUIRED;
     // One Confirm tap covers the whole summary the customer confirmed — which
     // may list several treatments (sauna + two floats). Consuming it on the
     // FIRST booking made every later book_appointment in the same turn bounce
@@ -1283,8 +1907,39 @@ async function toolBookAppointment(from, { session_type_id, start_date_time, sta
     }
   }
 
+  // The day the guest confirmed. Melanie, 23 Nov 2026: she confirmed "Saturday
+  // 25 November at 12:00" and the slot was Wednesday's. The summary that goes
+  // out now always names a real day, and the day(s) it named are remembered
+  // (reply-guards.js, confirmSummary): a slot on any other day is not booked
+  // under that Confirm. It also closes what the offered-slot gate above left
+  // open — after its "you most likely wrote the WRONG DATE" the next call, for
+  // the day that WAS fetched, used to book under the same tap although the
+  // guest had confirmed the other day. The Confirm is spent: a new summary and
+  // a fresh tap are needed. Nothing remembered (restart, 30 minutes of
+  // silence, a summary sent before this check existed) → book as before; a
+  // late Confirm must keep working (Maria incident).
+  if (!skip_payment) {
+    const confirmed = conversationService.get(from)?.confirmSummary;
+    const day = String(start_date_time).slice(0, 10);
+    if (confirmed && Array.isArray(confirmed.dates) && !confirmed.dates.includes(day)) {
+      conversationService.update(from, { bookingConfirmedAt: null, bookingConfirmUsed: false, bookingsUnderConfirm: 0 });
+      const lang = conversationService.get(from)?.lang || 'en';
+      const fullDay = (d) => dayLabel(d, 'en', { year: true });
+      const named = confirmed.dates.map(fullDay).join(' and ');
+      logger.warn(`book_appointment blocked — ${start_date_time} is not a day of the confirmed summary (${confirmed.dates.join(', ') || 'no day named'})`);
+      return {
+        error: 'confirmed_day_differs',
+        message: named
+          ? `STOP: the summary the customer confirmed was for ${named}, but this call books ${fullDay(day)}. Nothing was booked. Show a new confirmation summary with the day written exactly as "${dayLabel(day, lang)}" and book only after a fresh Confirm — or, if the customer wants ${confirmed.dates.map(d => dayLabel(d, 'en')).join(' or ')}, check availability for that day first.`
+          : `STOP: the summary the customer confirmed did not name the day, and this call books ${fullDay(day)}. Nothing was booked. Show a new confirmation summary with the day written exactly as "${dayLabel(day, lang)}" and book only after a fresh Confirm.`,
+      };
+    }
+  }
+
   if (isPayFirstType) {
-    return bookPayFirst(from, { client, session_type_id, start_date_time, staff_id, client_name, client_email, notes, companionNote, replaceRows: payFirstReplaceRows });
+    const started = await bookPayFirst(from, { client, session_type_id, start_date_time, staff_id, client_name, client_email: contactEmail, notes, emailNote, companionNote, replaceRows: payFirstReplaceRows });
+    if (started?.success) await bookedForOwner();
+    return started;
   }
 
   // 2. Book appointment — extract Mindbody error message on failure
@@ -1297,6 +1952,7 @@ async function toolBookAppointment(from, { session_type_id, start_date_time, sta
   const noteParts = [botTag];
   if (payOnLocation) noteParts.push('UNPAID — pay on location');
   if (companionNote) noteParts.push(companionNote);
+  if (emailNote) noteParts.push(emailNote);
   if (notes) noteParts.push(notes);
   const finalNotes = noteParts.join(' | ');
 
@@ -1378,11 +2034,14 @@ async function toolBookAppointment(from, { session_type_id, start_date_time, sta
   }
 
   const serviceName = getServiceName(session_type_id);
-  const dateLabel = formatDutchDate(start_date_time);
   const timeLabel = formatDutchTime(start_date_time);
   const lang = conversationService.get(from)?.lang || 'en';
   const atWord = lang === 'nl' ? 'om' : 'at';
+  // In the chat language for the model; the cart label (the Stripe line item)
+  // keeps its old form — see the repeat check above.
+  const dateLabel = dayLabel(start_date_time, lang);
   const dateTimeLabel = `${dateLabel} ${atWord} ${timeLabel}`;
+  const cartLabel = `${formatDutchDate(start_date_time)} ${atWord} ${timeLabel}`;
 
   // 3. Log to DB
   // One atomic INSERT — the appointment id and date must never arrive in a
@@ -1429,6 +2088,8 @@ async function toolBookAppointment(from, { session_type_id, start_date_time, sta
     return { error: 'booking_failed', mindbody_message: 'We could not fully confirm your booking just now. Please try again in a moment.' };
   }
 
+  await bookedForOwner();
+
   // Booking succeeded — clear any failed-slot records for this treatment so a
   // slot that later freed up isn't permanently blocked from being re-offered.
   const priorFailed = conversationService.get(from)?.failedSlots;
@@ -1457,7 +2118,8 @@ async function toolBookAppointment(from, { session_type_id, start_date_time, sta
         appointment_id: appointment.Id,
         session_type_id,
         service_name: serviceName,
-        date_time_label: dateTimeLabel,
+        date_time_label: cartLabel,
+        when_label: dateTimeLabel,
         amount_cents: priceCents,
         pay_on_location: true,
       });
@@ -1514,14 +2176,15 @@ async function toolBookAppointment(from, { session_type_id, start_date_time, sta
     appointment_id: appointment.Id,
     session_type_id,
     service_name: serviceName,
-    date_time_label: dateTimeLabel,
+    date_time_label: cartLabel,
+    when_label: dateTimeLabel,
     amount_cents: priceCents,
   });
 
   // Keep the billing details on the conversation so the automatic payment link
   // below can pre-fill the Stripe checkout even though the model isn't involved.
   conversationService.set(from, {
-    customerEmail: client_email || conversationService.get(from)?.customerEmail || client.Email || null,
+    customerEmail: contactEmail,
     customerName:  client_name  || conversationService.get(from)?.customerName  || `${client.FirstName || ''} ${client.LastName || ''}`.trim() || null,
   });
 
@@ -1892,10 +2555,101 @@ function scheduleAutoPaymentLink(from) {
 async function toolSendPayment(from, args = {}) {
   // The model is billing now, so the automatic fallback is no longer needed.
   cancelAutoPaymentLink(from);
-  return billPendingBookings(from, args);
+  // Stripe only ever gets an address the guest typed, the one book_appointment
+  // settled on, or the one stored for this number — not the model's own
+  // (Touriya, 27 Sep 2026).
+  const customer_email = (await reachableEmail(from, args.customer_email, conversationService.get(from)?.customerEmail)) || undefined;
+  return billPendingBookings(from, { ...args, customer_email });
 }
 
-async function toolGetAppointments(from, { client_phone, client_email, client_name } = {}) {
+// ---- The 24-hour rule (cancelling or moving is charged in full) ----
+// Shanta, 1 Nov 2026: the team's policy is that an appointment cancelled or
+// rescheduled within 24 hours of its start is charged in full. Whether a start
+// is "within 24 hours" is decided here, on the server clock — not by the model.
+const LATE_CHANGE_MS = 24 * 60 * 60 * 1000;
+// A guest who writes after the start is a no-show (same policy). Up to 12
+// hours after the start that still counts as "inside 24 hours"; anything older
+// is an appointment that took place or was missed (see startedLongAgo).
+const NO_SHOW_WINDOW_MS = 12 * 60 * 60 * 1000;
+
+/**
+ * Milliseconds until a start time on the server clock (negative once it has
+ * started), or null when it can't be read. Starts are naive Amsterdam-local
+ * datetimes as Mindbody returns them ("2026-11-01T09:00:00"), compared with
+ * the server's own local time — never UTC.
+ * "24 hours" is elapsed time, as it always was in get_appointments: on the two
+ * clock-change weekends the line sits an hour off the wall clock. Whether the
+ * team means clock hours there is an open question — don't "fix" it unasked.
+ */
+function msUntilStart(start, now = new Date()) {
+  if (!start) return null;
+  const ms = new Date(String(start)).getTime() - now.getTime();
+  return Number.isNaN(ms) ? null : ms;
+}
+
+/**
+ * Is a change to an appointment starting at `start` "inside 24 hours"?
+ * true  = starts within the next 24 hours, or started less than 12 hours ago;
+ * false = 24 hours or more away;
+ * null  = not for this rule: unreadable (the caller falls back to its next
+ *         source) or started 12 hours ago or more (see startedLongAgo).
+ */
+function isLateChange(start, now = new Date()) {
+  const ms = msUntilStart(start, now);
+  if (ms === null) return null;
+  if (ms >= LATE_CHANGE_MS) return false;
+  return ms > -NO_SHOW_WINDOW_MS ? true : null;
+}
+
+/** Started 12 hours ago or more: the appointment took place or was missed. */
+function startedLongAgo(start, now = new Date()) {
+  const ms = msUntilStart(start, now);
+  return ms !== null && ms <= -NO_SHOW_WINDOW_MS;
+}
+
+const LATE_CHANGE_POLICY = 'Starts within 24 hours. If the customer wants to cancel or move it: that is charged in full — tell them exactly that plus both options (someone else may come in their place; with medical proof they can ask the team for an exception). Never say it is free and never promise an exception.';
+const CANCELLED_LATE_NOTE = 'Cancelled inside 24 hours: per the cancellation policy the full amount is charged. Do not promise a refund, a credit or an exception — only the team can decide that.';
+// An appointment that has already started (review of the Shanta fix): it is no
+// longer "within 24 hours" for the model, but cancelling it is not free either.
+const ALREADY_STARTED_POLICY = 'Already started. Only if the customer wants to cancel or move it: that is charged in full, as for a no-show — say so before they confirm. Never say it is free and never promise a refund or an exception; only the team can decide that.';
+const CANCELLED_AFTER_START_NOTE = 'Cancelled after the appointment had started: per the cancellation policy the full amount is charged, as for a no-show. Do not promise a refund, a credit or an exception — only the team can decide that.';
+
+// What the guest says they booked, kept across the "what is your email?"
+// round (ask_for_details): two messages later the model often passes only the
+// address. Reused for 15 minutes, then it is a new question.
+const LOOKUP_EXPECTATION_MS = 15 * 60 * 1000;
+
+function expectationOf({ customer_expects, expected_date, expected_count, expected_other_people } = {}) {
+  return {
+    customer_expects: String(customer_expects || '').trim(),
+    expected_date: expected_date || null,
+    expected_count: Number.isInteger(expected_count) ? expected_count : null,
+    expected_other_people: expected_other_people === true,
+  };
+}
+
+const LOOKUP_INSTRUCTION = 'This list is built by the server and is complete for the profile it names. Say only what is in it: the same number of appointments, dates, start times and treatment names. Never add, merge, split, rename or infer an appointment, and never use the customer\'s own description to fill a gap. You cannot see other people\'s profiles or cancelled bookings. serviceName null means the booking system does not show which treatment it is: say exactly that, never guess.';
+const SERVER_REPLY_INSTRUCTION = ' The server sends the customer this overview itself: call respond once with ui_type "none" and one short line; your text is not sent. Do not call request_human_handoff for this.';
+// Found in review: told to "say only what is in it", the model restated the
+// list the server had just sent — the guest read it twice.
+const PLAIN_REPLY_INSTRUCTION = ' If you reply with ui_type "none", the server sends the customer this list right before your reply: do not repeat the list, only answer their question.';
+// Cancel and reschedule requests keep their own flow (confirm_cancel buttons).
+const CHANGE_REQUEST = /\b(?:cancel\w*|reschedul\w*|move|moving|annuleer\w*|annuler\w*|afzeg\w*|af\s+zeggen|verzet\w*|verplaats\w*|omboek\w*)\b/i;
+// So does a guest who can't come (Shanta, 1 Nov 2026: the policy and a
+// handoff). Found in the integration review: "my husband and I can't make it
+// today" was read as a claim about what is booked, and the server's "I can't
+// confirm that everything you described is booked" replaced the policy reply.
+const CANT_COME = /\b(?:can['’]?t|cannot|can\s+not|won['’]?t|will\s+not|not\s+able\s+to|unable\s+to)\s+(?:make\s+it|come|attend)\b|\bniet\s+(?:redden|halen|komen)\b|\b(?:ill|sick|ziek)\b/i;
+
+/**
+ * Tara, 19 Nov 2026: two rows named 'Treatment' became 'a lymphatic drainage
+ * followed by a facial for both you and your husband'. The list is named,
+ * complete and compared in code (appointment-overview.js); after the lookup
+ * the server's own list is what the guest sees (executeRespond), and when it
+ * cannot confirm what the guest described the team is flagged and mailed here,
+ * without the model having to hand off.
+ */
+async function toolGetAppointments(from, { client_phone, client_email, client_name, ...expectArgs } = {}) {
   let clients = [];
 
   // Helper: try all lookup strategies in order
@@ -1919,11 +2673,30 @@ async function toolGetAppointments(from, { client_phone, client_email, client_na
     }
   }
 
+  // The guest's own words; when the model passes none, the ones kept from the
+  // email round (if recent).
+  let expectation = expectationOf(expectArgs);
+  if (!expectation.customer_expects) {
+    const kept = conversationService.get(from)?.lookupExpectation;
+    if (kept?.customer_expects && Date.now() - kept.at < LOOKUP_EXPECTATION_MS) expectation = kept;
+  }
+  // The model left the guest's words out, but her own message in this turn
+  // involves another person ("…for me and my husband"): her words are the
+  // expectation — one profile can never confirm that (found in review). Not
+  // for a cancel or a reschedule: that flow has its own confirmation.
+  if (!expectation.customer_expects) {
+    const said = String(conversationService.get(from)?.turnGuestText || '').trim();
+    if (said && appointmentOverview.mentionsOtherPeople(said) && !CHANGE_REQUEST.test(said) && !CANT_COME.test(said)) {
+      expectation = expectationOf({ customer_expects: said.slice(0, 500) });
+    }
+  }
+
   const hasExtra = client_phone || client_email || client_name;
 
   // Always ask for email/name first — never rely on phone number alone.
   // Only proceed with the lookup once the customer has provided their details.
   if (!hasExtra) {
+    if (expectation.customer_expects) conversationService.set(from, { lookupExpectation: { ...expectation, at: Date.now() } });
     return {
       status: 'ask_for_details',
       instruction: 'Ask the customer: "To look up your booking, could you share the email address you used when you booked?"',
@@ -1933,11 +2706,13 @@ async function toolGetAppointments(from, { client_phone, client_email, client_na
   await tryLookups(from);
 
   if (clients.length === 0) {
+    if (expectation.customer_expects) conversationService.set(from, { lookupExpectation: { ...expectation, at: Date.now() } });
     return {
       status: 'not_found',
-      instruction: 'No account found. Tell the customer you cannot find their booking and direct them to welcome@renessence.com.',
+      instruction: 'No profile found under these details. Ask once whether the booking could be under another email address or name. If they confirm the details are right, call request_human_handoff (reason: booking not found, plus what they expect) and say the team will check and reply here. Do not send them to an email address.',
     };
   }
+  conversationService.set(from, { lookupExpectation: null });
 
   // Look back 7 days so yesterday's / recent appointments are visible too
   const lookbackDate = formatDateISO(addDays(new Date(), -7));
@@ -1948,9 +2723,28 @@ async function toolGetAppointments(from, { client_phone, client_email, client_na
     const appts = await mindbodyService.getStaffAppointments(lookbackDate, futureDate, client.Id);
     all = all.concat(appts);
   }
-  all.sort((a, b) => new Date(a.StartDateTime) - new Date(b.StartDateTime));
 
-  const appointments = await Promise.all(all.slice(0, 10).map(async apt => {
+  // Names of session types the bot does not sell (the team books those too).
+  // Optional: without them such a row is "a treatment booked by our team".
+  let names = {};
+  try { names = (await mindbodyService.getSessionTypeNames?.()) || {}; } catch (_) { names = {}; }
+
+  const lang = conversationService.get(from)?.lang || 'en';
+  const web = isWebSession(from);
+  // Pay-first bookings still waiting for payment are not in Mindbody yet: the
+  // guest's list names them (and their link), the comparison counts them.
+  let payFirstRows = [];
+  if (!web) {
+    try { payFirstRows = (await db.getPayFirstRowsForPhone?.(from)) || []; } catch (_) { payFirstRows = []; }
+  }
+  const overview = appointmentOverview.buildOverview(all, { names, now: new Date(), lang, payFirstRows });
+  // What the model gets: every upcoming appointment, after the most recent
+  // past one (Shanta: "your last appointment was on …", the no-show rule).
+  // Cancelled rows are left out, and past visits no longer push upcoming ones
+  // off the list.
+  const shown = [...(overview.lastPast ? [overview.lastPast] : []), ...overview.upcoming];
+  const appointments = await Promise.all(shown.map(async item => {
+    const apt = item.apt;
     // Look up payment status from DB.
     // If no record exists the booking was made externally (Mindbody website / front desk)
     // — assume paid so we don't incorrectly tell the customer they haven't paid.
@@ -1971,22 +2765,96 @@ async function toolGetAppointments(from, { client_phone, client_email, client_na
       isPaid = true;
     }
 
-    const apptTime = new Date(apt.StartDateTime);
+    // Shanta, 1 Nov 2026: "within 24 hours" used to be true for every PAST
+    // appointment of the 7-day look-back too, so a visit last week read as a
+    // late change. It now means: not started yet, and starting within 24 hours.
+    const msAhead = msUntilStart(apt.StartDateTime);
+    const isWithin24h = msAhead !== null && msAhead >= 0 && msAhead < LATE_CHANGE_MS;
+    const isPast = msAhead !== null && msAhead < 0;
     return {
       id: apt.Id,
-      serviceName: apt.SessionType?.Name || 'Treatment',
-      dateLabel: formatDutchDate(apt.StartDateTime),
+      serviceName: item.serviceName,
+      dateLabel: dayLabel(apt.StartDateTime, lang),
       timeLabel: formatDutchTime(apt.StartDateTime),
       dateTime: apt.StartDateTime,
-      isPast: apptTime < new Date(),
-      isWithin24h: (apptTime - new Date()) < 24 * 60 * 60 * 1000,
+      ...(item.forPerson ? { forPerson: item.forPerson } : {}),
+      isPast,
+      isWithin24h,
       isPaid,
+      ...(isWithin24h ? { late_change_policy: LATE_CHANGE_POLICY } : {}),
+      // Found in review: with past appointments no longer "within 24 hours"
+      // nothing told the model to warn before the confirmation, while the
+      // cancel after the tap is charged in full.
+      ...(isPast ? { already_started_policy: ALREADY_STARTED_POLICY } : {}),
     };
   }));
 
+  // Remember what was shown, so cancel_appointments can work out "inside 24
+  // hours" from the appointment's real start instead of the model's flag.
+  // set(), not update(): the state may have expired while Mindbody answered.
+  if (appointments.length > 0) {
+    const known = { ...(conversationService.get(from)?.knownAppointments || {}) };
+    for (const a of appointments) known[String(a.id)] = { dateTime: a.dateTime, serviceName: a.serviceName };
+    conversationService.set(from, { knownAppointments: known });
+  }
+
+  // Compare in code; the guest gets the server's text (executeRespond).
+  const check = appointmentOverview.checkExpectation(expectation, overview.allUpcoming, overview.pending);
+  const text = appointmentOverview.renderOverview(overview, check.verdict, lang, { web, clients });
+  // A guest who can't come, or wants to cancel or move something, needs the
+  // model's own reply (the policy, the confirm buttons): the list goes first
+  // and never replaces it. Found in the integration review: a lookup that
+  // matched "massage today at 9" replaced the late-cancel policy (Shanta).
+  const said = String(conversationService.get(from)?.turnGuestText || '');
+  const keepReply = CHANGE_REQUEST.test(said) || CANT_COME.test(said);
+  conversationService.set(from, {
+    lookupReply: {
+      text,
+      lang: lang === 'nl' ? 'nl' : 'en',
+      // Re-rendered when the reply that carries it is in another language
+      // (a guest writing Dutch for the first time; found in review).
+      render: { overview, verdict: check.verdict, web, clients },
+      mustReplace: check.verdict === 'needs_team' && !keepReply,
+      expectationGiven: check.verdict !== 'not_requested' && !keepReply,
+      keepReply,
+    },
+  });
+
+  if (check.verdict === 'needs_team') {
+    try {
+      const words = expectation.customer_expects;
+      db.markConversationEscalated(from, `Booking check: guest expects "${words.slice(0, 100)}" — Mindbody shows ${overview.totalUpcoming}`);
+      if (!(await db.hasRecentTeamNotification?.(from, 'booking_check', TEAM_NOTIFY_COOLDOWN_MIN))) {
+        const within24h = overview.upcoming.some(a => {
+          const ms = msUntilStart(a.dateTime);
+          return ms !== null && ms > -NO_SHOW_WINDOW_MS && ms < LATE_CHANGE_MS;
+        });
+        const note = appointmentOverview.teamNote({ words, clients, overview, reasons: check.reasons, within24h, web });
+        const customerName = conversationService.get(from)?.userName
+          || [clients[0]?.FirstName, clients[0]?.LastName].filter(Boolean).join(' ') || 'Unknown';
+        const customerEmail = await reachableEmail(from, client_email, clients[0]?.Email);
+        await db.logEscalation(from, customerName, 'booking_check', note);
+        emailService.sendEscalationEmail({ customerName, customerPhone: from, customerEmail: customerEmail || null, message: note })
+          .catch(err => logger.error('Booking check email error:', err.message));
+      }
+    } catch (err) {
+      // The guest still gets the list; the flag above is the team's signal.
+      logger.error(`[${from}] booking check alert failed:`, err.message);
+    }
+  }
+
   let payFirstStatus = null;
   try { payFirstStatus = await payFirst.statusLine(from); } catch (_) { /* optional */ }
-  return payFirstStatus ? { appointments, pay_first_status: payFirstStatus } : { appointments };
+  const serverReply = check.verdict !== 'not_requested' && !keepReply;
+  return {
+    profile: appointmentOverview.profileLabel(clients).label,
+    count_upcoming: overview.totalUpcoming,
+    appointments,
+    check: check.verdict,
+    ...(serverReply ? { server_reply: true } : {}),
+    instruction: LOOKUP_INSTRUCTION + (serverReply ? SERVER_REPLY_INSTRUCTION : PLAIN_REPLY_INSTRUCTION),
+    ...(payFirstStatus ? { pay_first_status: payFirstStatus } : {}),
+  };
 }
 
 async function toolCancelAppointments(from, { appointment_ids, is_reschedule, is_within_24h, service_name, date_time }) {
@@ -2009,8 +2877,22 @@ async function toolCancelAppointments(from, { appointment_ids, is_reschedule, is
 
   const cancelled = [];
   const failed = [];
+  // Cancelled inside 24 hours / after the appointment took place (decided
+  // below, per appointment).
+  const cancelledLate = [];
+  const cancelledAfterStart = [];
+  // Why the team has to look at this chat. The dashboard keeps ONE reason per
+  // guest and the last write wins, so everything this cancellation raises goes
+  // out as one line at the end — a late cancel and a refund in the same call
+  // used to leave only one of the two on the dashboard.
+  const teamReasons = [];
   const conv = conversationService.get(from);
   const customerName = conv?.userName || null;
+  // The day as the model wrote it goes into the team's emails: with a note
+  // when its weekday does not match its date (dateCheckNote). The cancellation
+  // itself goes by appointment id and is never held up by it.
+  const dateNote = dateCheckNote(date_time, { lone: 'none' });
+  logDateCheck(from, customerName, dateNote);
 
   for (const id of appointment_ids) {
     try {
@@ -2042,6 +2924,39 @@ async function toolCancelAppointments(from, { appointment_ids, is_reschedule, is
       // the appointment is released), but the calendar entry can linger as a
       // billable no-show. Tell the team so therapist pay/billing gets corrected.
       const recordedAsNoShow = /^no[\s-]?show$/i.test(String(cancelledApt?.Status || '').trim());
+
+      // Inside 24 hours? The server decides; the model's is_within_24h is only
+      // a hint. Found while checking the Shanta incident (1 Nov 2026; it did
+      // not happen to her): with the flag simply left out, cancelling a paid
+      // appointment two hours before its start sent finance a refund request
+      // and promised the guest a refund within 7 business days. In order:
+      // what get_appointments showed for this id, else the start time in
+      // Mindbody's own cancel reply, else the model's flag (state gone after
+      // a restart or the 30-minute TTL, and no start in the reply).
+      const known = conversationService.get(from)?.knownAppointments?.[String(id)] || null;
+      const start = msUntilStart(known?.dateTime) !== null ? known.dateTime : cancelledApt?.StartDateTime;
+      // Started 12 hours ago or more: it took place or was missed. That is not
+      // "inside 24 hours", but it is never a free cancellation either — found
+      // in review of this fix: get_appointments no longer calls such an
+      // appointment "within 24 hours", so the model left the flag off and a
+      // paid no-show from the day before got a refund request and a refund
+      // promise. No refund, no promise, and the team looks at it.
+      const afterStart = startedLongAgo(start);
+      let late = isLateChange(start);
+      if (late === null) late = afterStart ? false : !!is_within_24h;
+      if (late) cancelledLate.push(id);
+      if (afterStart) cancelledAfterStart.push(id);
+      const chargedInFull = late || afterStart;
+      // Nothing is refunded or promised then: the full amount is charged (paid
+      // online or due at reception) and only the team can decide otherwise —
+      // so every such cancel lands in front of them. Noted here, before the
+      // side-effects, so that none of them failing can lose it.
+      if (chargedInFull) {
+        const treatment = bookingRow?.service_name || known?.serviceName || service_name || 'treatment';
+        teamReasons.push(late
+          ? `Late cancellation (inside 24h): ${treatment} — check the fee`
+          : `Cancelled after its start time: ${treatment} — check the fee`);
+      }
 
       // Side-effects run in their own try/catch so they never flip this ID to failed[]
       try {
@@ -2078,22 +2993,23 @@ async function toolCancelAppointments(from, { appointment_ids, is_reschedule, is
           customerPhone: from,
           serviceName: bookingRow?.service_name || service_name,
           dateTime: bookingRow?.start_date_time || date_time,
-          isWithin24h: !!is_within_24h,
+          isWithin24h: chargedInFull,
           isReschedule: !!is_reschedule,
           statusNote: recordedAsNoShow
             ? 'Mindbody recorded this cancellation with status "NoShow". The booking is released, but the calendar entry may still show as a billable no-show — please check the appointment in Mindbody and correct it to a cancellation if needed (therapist pay/billing).'
             : null,
+          ...(dateNote ? { dateNote } : {}),
         }).catch(err => logger.error('Cancellation notification email error:', err.message));
 
         // If paid, not a reschedule, and outside 24h → notify finance team for refund
-        // Within 24h: no refund per policy (full amount charged)
-        if (bookingRow && !is_reschedule && !is_within_24h) {
+        // Within 24h or after the start: no refund per policy (full amount charged)
+        if (bookingRow && !is_reschedule && !chargedInFull) {
           // The refund NOTIFICATION comes before the refund PROMISE: the email
           // is the only thing that makes the promise true, and it must not be
           // skippable by a WhatsApp send throwing first. A failed email writes
           // a review flag so the refund can't silently evaporate (final-gate
           // contract finding).
-          db.markConversationEscalated(from, `Refund to process: ${bookingRow.service_name || 'treatment'}`);
+          teamReasons.push(`Refund to process: ${bookingRow.service_name || 'treatment'}`);
           try {
             await emailService.sendRefundNotificationEmail({
               customerName: bookingRow.customer_name,
@@ -2128,16 +3044,30 @@ async function toolCancelAppointments(from, { appointment_ids, is_reschedule, is
   // the customer it's cancelled — instead ask the team to cancel it by hand.
   if (failed.length > 0) {
     logger.warn(`Cancellation FAILED for appointment(s) ${failed.join(', ')} — escalating to team for manual cancellation`);
-    db.markConversationEscalated(from, 'Cancellation failed — cancel it in Mindbody by hand');
+    teamReasons.push('Cancellation failed — cancel it in Mindbody by hand');
     emailService.sendEscalationEmail({
       customerName,
       customerPhone: from,
       customerEmail: null,
       message: `⚠️ AUTOMATIC CANCELLATION FAILED — please cancel this in Mindbody by hand so the slot is freed. Appointment ID(s): ${failed.join(', ')}. Treatment: ${service_name || 'unknown'} on ${date_time || 'unknown'}. The bot did NOT tell the customer it was cancelled; it said the team would take care of it.`,
+      ...(dateNote ? { dateNote } : {}),
     }).catch(err => logger.error('Failed-cancel escalation email error:', err.message));
   }
 
-  return { cancelled, failed };
+  if (teamReasons.length > 0) db.markConversationEscalated(from, teamReasons.join(' · '));
+
+  // Several appointments in one cancellation, not all of them charged: say
+  // which, or the model would call the refunded one "charged in full" too.
+  const onlyFor = (ids) => (ids.length < cancelled.length ? ` This applies to appointment ${ids.join(', ')} only.` : '');
+  const notes = [];
+  if (cancelledLate.length > 0) notes.push(`${CANCELLED_LATE_NOTE}${onlyFor(cancelledLate)}`);
+  if (cancelledAfterStart.length > 0) notes.push(`${CANCELLED_AFTER_START_NOTE}${onlyFor(cancelledAfterStart)}`);
+  return {
+    cancelled,
+    failed,
+    ...(cancelledLate.length > 0 ? { within24h: true } : {}),
+    ...(notes.length > 0 ? { policy_note: notes.join(' ') } : {}),
+  };
 }
 
 async function toolCheckClassSchedule(from, { session_type_ids, start_date, end_date }) {
@@ -2146,6 +3076,7 @@ async function toolCheckClassSchedule(from, { session_type_ids, start_date, end_
   try {
     const classes = await mindbodyService.getClasses(session_type_ids, start_date, end_date);
     const now = new Date();
+    const lang = conversationService.get(from)?.lang || 'en';
 
     const result = classes
       .filter(c => {
@@ -2162,7 +3093,7 @@ async function toolCheckClassSchedule(from, { session_type_ids, start_date, end_
         id: `class_${c.Id}`,
         classId: c.Id,
         name: c.ClassDescription?.Name || 'Studio Class',
-        dateLabel: formatDutchDate(c.StartDateTime),
+        dateLabel: dayLabel(c.StartDateTime, lang),
         timeLabel: formatDutchTime(c.StartDateTime),
         dateTime: c.StartDateTime,
         sessionTypeId: c.ClassDescription?.SessionType?.Id || session_type_ids[0],
@@ -2176,7 +3107,7 @@ async function toolCheckClassSchedule(from, { session_type_ids, start_date, end_
   }
 }
 
-async function toolBookClass(from, { class_id, session_type_id, class_name, class_date_time, client_name, client_email }) {
+async function toolBookClass(from, { class_id, session_type_id, class_name, class_date_time, client_name, client_email, client_phone }) {
   {
     const p = settings.pausedTreatment(session_type_id || 83);
     if (p) return pausedResult(p);
@@ -2185,33 +3116,27 @@ async function toolBookClass(from, { class_id, session_type_id, class_name, clas
     const c = class_date_time ? closedFor(class_date_time, 0) : null;
     if (c) return closedResult(c, class_date_time);
   }
-  // 1. Find or create client
-  let client = await mindbodyService.getClientByPhone(from, client_email || null);
-  if (!client) {
-    if (!client_name || !client_email) {
-      return { error: 'client_info_required', message: 'Need full name and email to create account.' };
-    }
-    const parts = client_name.trim().split(' ');
-    const firstName = parts[0];
-    const lastName = parts.slice(1).join(' ') || 'WhatsApp';
-    try {
-      client = await mindbodyService.addClient({ firstName, lastName, email: client_email, mobilePhone: from, city: 'Amsterdam' });
-    } catch (addErr) {
-      if (addErr.response?.data?.Error?.Code === 'InvalidClientCreation') {
-        client = await mindbodyService.getClientByPhone(from, client_email);
-        if (!client) throw addErr;
-      } else throw addErr;
-    }
-  }
+  // 1. Find or create client — the same rules as book_appointment (Touriya,
+  // 27 Sep 2026): no invented address, no made-up surname, and in the website
+  // chat "web_<session>" is never looked up or stored as a phone number.
+  const guest = await resolveBookingGuest(from, { client_name, client_email, client_phone, tool: 'book_class', stored: await storedContact(from) });
+  if (guest.refusal) return guest.refusal;
+  const client = guest.client;
+  // A profile without a real address: only with one the guest typed or the
+  // one stored for their number — as in book_appointment.
+  const ownEmail = guest.email || guest.profileEmail || guest.storedEmail;
+  if (!ownEmail) return emailRequired(from, { tool: 'book_class', vetted: guest.vetted });
 
   // 2. Enrol in class
   const visit = await mindbodyService.addClientToClass(client.Id, class_id);
 
-  const dateLabel = formatDutchDate(class_date_time);
   const timeLabel = formatDutchTime(class_date_time);
   const lang = conversationService.get(from)?.lang || 'en';
   const atWord = lang === 'nl' ? 'om' : 'at';
+  // In the chat language for the model; the Stripe line item keeps its old form.
+  const dateLabel = dayLabel(class_date_time, lang);
   const dateTimeLabel = `${dateLabel} ${atWord} ${timeLabel}`;
+  const stripeLabel = `${formatDutchDate(class_date_time)} ${atWord} ${timeLabel}`;
 
   // 3. Log to DB
   const priceCents = paymentService.getPriceInCents(session_type_id);
@@ -2225,6 +3150,15 @@ async function toolBookClass(from, { class_id, session_type_id, class_name, clas
     appointmentDate: class_date_time,
     mindbodyAppointmentId: class_id,
   });
+  // Remember the guest / tell the team about a profile without an address —
+  // not for an enrolment that is rolled back just below.
+  if (bookingEventId || !priceCents) {
+    try {
+      await afterOwnBooking(from, { client, clientName: client_name, guest, email: guest.profileEmail || ownEmail });
+    } catch (err) {
+      logger.warn('Remembering the guest after a class booking failed:', err.message);
+    }
+  }
 
   // 4. Payment link.
   //
@@ -2263,9 +3197,11 @@ async function toolBookClass(from, { class_id, session_type_id, class_name, clas
         clientId: client.Id,
         from,
         serviceName: class_name,
-        dateTime: dateTimeLabel,
+        dateTime: stripeLabel,
         amount: priceCents,
-        customerEmail: client.Email || client_email,
+        // As before the profile's own address first — but never a placeholder
+        // on it, and never one the model made up.
+        customerEmail: guest.profileEmail || ownEmail,
         customerName: client_name || `${client.FirstName} ${client.LastName}`.trim(),
         bookingEventId,
         isClass: true,
@@ -2319,9 +3255,83 @@ async function classPaymentDeferred(from, bookingEventId, classId, className, da
 // pausing the bot stops the flow entirely anyway.
 const TEAM_NOTIFY_COOLDOWN_MIN = parseInt(process.env.TEAM_NOTIFY_COOLDOWN_MIN || '60', 10);
 
+// Shanta, 1 Nov 2026: the bot wrote "I have reported it" while a handoff
+// without an email address was refused here and alerted nobody. On WhatsApp
+// the team answers in the chat itself and the phone number is known, so a
+// missing email never blocks the three team forwards below. Website chat is
+// different: the team cannot write back there, so the email stays required.
+const needsEmailToReach = (from) => String(from).startsWith('web_');
+
+// Melanie, 23 Nov 2026: her chat ended with a handoff and a gift-card forward,
+// and what the team gets there is the day as the model wrote it ("Saturday 25
+// November"). A forward is never held back or rewritten — it is how a guest
+// reaches a person. It gets a note written by code instead: the day the
+// request came in, every weekday that does not match its date, and for a
+// weekday without a date ("next Friday") the dates it can mean. Null when
+// there is nothing to note. Never throws.
+// `lone` — which weekdays without a date get candidate dates (found in
+// review: "lost a ring last Saturday", "open Monday to Friday" and "Black
+// Friday" in a handoff reason each got two future dates and "please confirm
+// the day with the guest"):
+//   'all'    a field that IS the requested day (preferred_day, new_date);
+//   'future' free text (the handoff reason): only "next / this / coming
+//            Friday", "volgende / komende / aanstaande vrijdag";
+//   'none'   a cancellation — cancelled by id, its real start is known.
+const FUTURE_WORD = /(?<![\p{L}])(?:next|this coming|this|coming|upcoming|volgende|komende|aanstaande|deze)[ \t]{1,3}$/iu;
+const NOT_A_DAY_ASKED = /(?<![\p{L}])(?:last|every|each|black|afgelopen|vorige|elke|iedere)[ \t]{1,3}$/iu;
+const WEEKDAY_WORD = '(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|maandag|dinsdag|woensdag|donderdag|vrijdag|zaterdag|zondag)';
+const DAYS_JOIN = '[ \\t]{0,3}(?:to|till|until|through|–|-|t\\/m|tot|and|or|en|of|&|\\/|,)[ \\t]{0,3}';
+const RANGE_AFTER = new RegExp(`^\\p{L}{0,6}${DAYS_JOIN}${WEEKDAY_WORD}`, 'iu');   // "Monday| to Friday"
+const RANGE_BEFORE = new RegExp(`${WEEKDAY_WORD}\\p{L}{0,6}${DAYS_JOIN}$`, 'iu'); // "Monday to |Friday"
+function dateCheckNote(text, { lone = 'all' } = {}) {
+  try {
+    const now = new Date();
+    const s = typeof text === 'string' ? text : '';
+    const full = (d) => dayLabel(d, 'en', { year: true });
+    const lines = [];
+    for (const hit of findWeekdayDates(s, now)) {
+      if (hit.ok) continue;
+      lines.push(hit.date
+        ? `Date check: ${full(hit.date).split(' ').slice(1).join(' ')} is a ${EN_DAYS[hit.actual]}, not a ${EN_DAYS[hit.weekday]} — please confirm the day with the guest.`
+        : `Date check: "${hit.text.trim()}" is not a date that exists — please confirm the day with the guest.`);
+    }
+    for (const word of (lone === 'none' ? [] : loneWeekdays(s, now))) {
+      const before = s.slice(Math.max(0, word.index - 20), word.index);
+      const after = s.slice(word.index + word.token.length);
+      if (NOT_A_DAY_ASKED.test(before) || RANGE_AFTER.test(after) || RANGE_BEFORE.test(before)) continue;
+      if (lone === 'future' && !FUTURE_WORD.test(before)) continue;
+      const around = weekdaysAround(word.weekday, now, now);
+      const options = around.today
+        ? `${full(around.today)} (today) or ${full(around.coming)}`
+        : `${full(around.coming)} or ${full(weekdaysAround(word.weekday, around.coming, now).near.slice(-1)[0])}`;
+      lines.push(`No date was given for "${word.token}": it can be ${options} — please confirm the day with the guest.`);
+    }
+    const unique = [...new Set(lines)];
+    return unique.length > 0 ? `Request received ${full(now)}. ${unique.join(' ')}` : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+// The note in the escalation log, as an entry of its own: the forward's own
+// entry is what the repeat check compares, so its text stays exactly the
+// request.
+function logDateCheck(from, customerName, note) {
+  if (!note) return;
+  try {
+    Promise.resolve(db.logEscalation(from, customerName, 'date_check', note)).catch(() => {});
+  } catch (_) { /* best-effort */ }
+}
+
+// Touriya, 27 Sep 2026: with the email field required, the model put an
+// address there that nobody had typed and the team got it as "the guest's
+// email". The three forwards pass on only an address the guest typed or the
+// one stored for their number (reachableEmail); anything else is dropped. On
+// WhatsApp that never holds a forward back.
 async function toolHumanHandoff(from, name, { reason, customer_email }) {
-  if (!customer_email) {
-    return { sent: false, error: 'email_required', message: 'Ask the customer for their email address before escalating.' };
+  customer_email = await reachableEmail(from, customer_email);
+  if (!customer_email && needsEmailToReach(from)) {
+    return { sent: false, error: 'email_required', message: 'Ask the visitor for an email address so our team can reach them - only an address they type in this chat counts.' };
   }
   const conv = conversationService.get(from);
   const customerName = conv?.userName || name || 'Unknown';
@@ -2340,8 +3350,10 @@ async function toolHumanHandoff(from, name, { reason, customer_email }) {
     });
   }
 
+  const dateNote = dateCheckNote(reason, { lone: 'future' });
   db.logEscalation(from, customerName, 'human_handoff', reason);
-  emailService.sendEscalationEmail({ customerName, customerPhone: from, customerEmail: customer_email, message: reason })
+  logDateCheck(from, customerName, dateNote);
+  emailService.sendEscalationEmail({ customerName, customerPhone: from, customerEmail: customer_email || null, message: reason, ...(dateNote ? { dateNote } : {}) })
     .catch(err => logger.error('Escalation email error:', err.message));
   return withPaymentLinksClosed(from, { sent: true });
 }
@@ -2365,7 +3377,8 @@ async function withPaymentLinksClosed(from, result) {
 
 // Reschedules are arranged by the team, not the bot (cancel+rebook here caused
 // paid-but-cancelled edge cases). The bot states the policy, collects the new
-// date + treatment + email, and forwards it to welcome@.
+// date + treatment (and an email only if the guest gives one — see
+// needsEmailToReach), and forwards it to welcome@.
 async function toolForwardReschedule(from, name, { new_date, treatment, customer_email, customer_name, current_appointment }) {
   if (!new_date || !treatment) {
     return {
@@ -2374,11 +3387,12 @@ async function toolForwardReschedule(from, name, { new_date, treatment, customer
       message: 'Before forwarding, ask for whatever is still missing: the new date they want and the treatment (appointment type).',
     };
   }
-  if (!customer_email) {
+  customer_email = await reachableEmail(from, customer_email);
+  if (!customer_email && needsEmailToReach(from)) {
     return {
       sent: false,
       error: 'email_required',
-      message: 'Ask the customer for their email before forwarding — the team needs it to confirm the new time with them.',
+      message: 'Ask the customer for their email before forwarding — the team needs it to reach them. Only an address they type in this chat counts.',
     };
   }
   const conv = conversationService.get(from);
@@ -2389,18 +3403,21 @@ async function toolForwardReschedule(from, name, { new_date, treatment, customer
   // treatment, the team still gets the updated request.
   if (await db.hasRecentTeamNotification(from, 'reschedule_request', TEAM_NOTIFY_COOLDOWN_MIN, detail)) {
     logger.info(`Reschedule email suppressed — identical request already sent: ${from}`);
-    return withPaymentLinksClosed(from, { sent: true, already_sent: true, message: 'This exact reschedule request was already sent to the team. Do NOT send it again — just reassure the customer the team will confirm the new time.' });
+    return withPaymentLinksClosed(from, { sent: true, already_sent: true, message: 'This exact reschedule request was already sent to the team. Do NOT send it again — tell the customer the team has the request and will get back to them. Do not promise the new time.' });
   }
 
+  const dateNote = dateCheckNote(new_date);
   db.logEscalation(from, customerName, 'reschedule_request', detail);
+  logDateCheck(from, customerName, dateNote);
   db.markConversationEscalated(from, `Reschedule request: ${String(treatment || '').slice(0, 60)} → ${String(new_date || '').slice(0, 60)}`);
   emailService.sendRescheduleRequestEmail({
     customerName,
     customerPhone: from,
-    customerEmail: customer_email,
+    customerEmail: customer_email || null,
     newDate: new_date,
     treatment,
     currentAppointment: current_appointment,
+    ...(dateNote ? { dateNote } : {}),
   }).catch(err => logger.error('Reschedule email error:', err.message));
   return withPaymentLinksClosed(from, { sent: true });
 }
@@ -2432,11 +3449,12 @@ async function toolForwardGiftCard(from, name, { gift_card_number, treatment, pr
         : 'Before forwarding, ask the customer for whatever is still missing: the gift card number, the treatment they want, and the day (with a time preference if they have one).',
     };
   }
-  if (old_system && !customer_email) {
+  customer_email = await reachableEmail(from, customer_email);
+  if (old_system && !customer_email && needsEmailToReach(from)) {
     return {
       sent: false,
       error: 'email_required',
-      message: 'For an old-system gift card the team needs to reach the customer — ask for their email before forwarding.',
+      message: 'For an old-system gift card the team needs to reach the customer — ask for their email before forwarding. Only an address they type in this chat counts.',
     };
   }
   const conv = conversationService.get(from);
@@ -2451,16 +3469,19 @@ async function toolForwardGiftCard(from, name, { gift_card_number, treatment, pr
     return withPaymentLinksClosed(from, { sent: true, already_sent: true, message: 'This exact gift-card request was already sent to the team. Do NOT send it again — just reassure the customer the team will be in touch.' });
   }
 
+  const dateNote = dateCheckNote(preferred_day);
   db.logEscalation(from, customerName, kind, detail);
+  logDateCheck(from, customerName, dateNote);
   db.markConversationEscalated(from, old_system ? 'Old gift card — transfer needed' : 'Gift card booking request');
   emailService.sendGiftCardRequestEmail({
     customerName,
     customerPhone: from,
-    customerEmail: customer_email,
+    customerEmail: customer_email || null,
     giftCardNumber: gift_card_number,
     treatment,
     preferredDay: preferred_day,
     oldSystem: !!old_system,
+    ...(dateNote ? { dateNote } : {}),
   }).catch(err => logger.error('Gift card email error:', err.message));
   return withPaymentLinksClosed(from, { sent: true });
 }
@@ -2470,8 +3491,40 @@ async function toolForwardGiftCard(from, name, { gift_card_number, treatment, pr
 // Web chat callback map: webFrom -> resolve fn
 const webCallbacks = new Map();
 
-async function executeRespond(from, args) {
-  const { message, ui_type, buttons, list_sections, list_button_label, cta_label, cta_url, detected_language } = args;
+// Same idea as the pay-first link: after a lookup the server's own list goes
+// out, not the model's reading of it (Tara, 19 Nov 2026). Not twice within
+// ten minutes when it only goes before the model's reply.
+const LOOKUP_REPEAT_MS = 10 * 60 * 1000;
+
+/** A lookup's list in the chat's language now (the reply may have just switched it). */
+function lookupTextFor(from, lookup) {
+  const lang = conversationService.get(from)?.lang === 'nl' ? 'nl' : 'en';
+  if (!lookup.render || lookup.lang === lang) return lookup.text;
+  const r = lookup.render;
+  return appointmentOverview.renderOverview(r.overview, r.verdict, lang, { web: r.web, clients: r.clients });
+}
+
+/**
+ * A lookup's list that no reply carried yet (the model never answered, or its
+ * call failed): sent as the whole reply. true when it went out.
+ */
+async function sendPendingLookup(from) {
+  const lookup = conversationService.get(from)?.lookupReply;
+  if (!lookup) return false;
+  conversationService.update(from, { lookupReply: { ...lookup, mustReplace: true } });
+  await executeRespond(from, { message: '', ui_type: 'none' });
+  return true;
+}
+
+/**
+ * @param {object} [opts]
+ * @param {boolean} [opts.wroteThisTurn] a booking, class booking, cancel or
+ *   payment ran in this turn: the model's text explains what happened and is
+ *   not replaced by a lookup's list (unless the list must go out).
+ */
+async function executeRespond(from, args, opts = {}) {
+  let { message } = args;
+  const { ui_type, buttons, list_sections, list_button_label, cta_label, cta_url, detected_language } = args;
 
   if (detected_language) {
     const langChanged = conversationService.get(from)?.lang !== detected_language;
@@ -2517,14 +3570,87 @@ async function executeRespond(from, args) {
     }
   }
 
+  // Tara, 4 Nov 2026: the model may imitate the label restored history puts
+  // on a colleague's lines (team-context.js). It never poses as one.
+  message = teamContext.stripColleagueLabel(message);
+
+  // A lookup in this turn (get_appointments): the guest gets the server's own
+  // list. When it could not confirm what the guest described it replaces the
+  // reply whatever the model chose (after a booking, cancel or payment call in
+  // this turn it goes before the reply instead); when the guest described something it
+  // replaces a plain reply; otherwise it goes before a plain reply. Buttons,
+  // lists and links are left alone (the cancel flow), and so is the
+  // explanation after a booking, cancel or payment in this turn.
+  let overviewFirst = null;
+  let replaced = false;
+  const interactive = ['buttons', 'list', 'cta_button'].includes(replyType);
+  const lookup = conversationService.get(from)?.lookupReply;
+  if (lookup) {
+    conversationService.update(from, { lookupReply: null });
+    const lookupText = lookupTextFor(from, lookup);
+    if (lookup.mustReplace && opts.wroteThisTurn) {
+      // A payment link made in this turn (send_payment) exists only in this
+      // reply: the list goes first, the link still goes out (found in review).
+      // The same for any reply after a booking call: found in the integration
+      // review, the question for a missing email address (Touriya, 27 Sep
+      // 2026) was replaced by the list, and the booking was silently not made.
+      overviewFirst = lookupText;
+    } else if (lookup.mustReplace) {
+      message = lookupText;
+      replaced = true;
+    } else if (lookup.keepReply && lookup.render?.verdict === 'needs_team' && !opts.wroteThisTurn) {
+      overviewFirst = lookupText;
+    } else if (!interactive && !opts.wroteThisTurn) {
+      if (lookup.expectationGiven) {
+        message = lookupText;
+        replaced = true;
+      } else {
+        const last = conversationService.get(from)?.lookupReplySent;
+        if (!(last && last.text === lookupText && Date.now() - last.at < LOOKUP_REPEAT_MS)) overviewFirst = lookupText;
+      }
+    }
+    if (replaced) replyType = 'none';
+    if (replaced || overviewFirst) conversationService.update(from, { lookupReplySent: { text: lookupText, at: Date.now() } });
+  }
+
+  // The first reply after a colleague's message says the AI is answering
+  // again (set by the message handler; Tara, 4 Nov 2026). Once — and the
+  // colleague message it was shown for is remembered, so a second guest
+  // message that arrives while this one is being sent does not get it again
+  // (found in review). In front of buttons, a list or a link it goes as its
+  // own message: a quoted question can take an interactive message over
+  // WhatsApp's 1024-character limit, and the buttons would be lost.
+  const state = conversationService.get(from);
+  const prefix = state?.replyPrefix;
+  if (prefix) {
+    conversationService.update(from, { replyPrefix: null, replyPrefixShownFor: state.replyPrefixFor ?? null });
+    const line = (state?.lang === 'nl' ? prefix.nl : prefix.en) || prefix.en;
+    if (line && overviewFirst) overviewFirst = `${line}\n\n${overviewFirst}`;
+    else if (line && ['buttons', 'list', 'cta_button'].includes(replyType)) overviewFirst = line;
+    else if (line) message = `${line}\n\n${message}`;
+  }
+
   // Web chat mode — resolve callback instead of sending via WhatsApp
   if (from.startsWith('web_') && webCallbacks.has(from)) {
     const resolve = webCallbacks.get(from);
     webCallbacks.delete(from);
+    // One answer per web message: the list and the model's reply together.
+    if (overviewFirst) message = `${overviewFirst}\n\n${message}`;
     conversationService.addMessage(from, 'assistant', message);
     db.logMessage(from, 'assistant', message);
-    resolve({ message, ui_type: ui_type || 'text', buttons, list_sections, list_button_label, cta_label, cta_url });
+    if (replaced) resolve({ message, ui_type: 'text' });
+    else resolve({ message, ui_type: ui_type || 'text', buttons, list_sections, list_button_label, cta_label, cta_url });
     return;
+  }
+
+  if (overviewFirst) {
+    try {
+      await whatsappService.sendText(from, overviewFirst);
+      conversationService.addMessage(from, 'assistant', overviewFirst);
+      db.logMessage(from, 'assistant', overviewFirst);
+    } catch (err) {
+      logger.warn('Appointment overview send failed:', err.message);
+    }
   }
 
   try {
@@ -2610,5 +3736,7 @@ module.exports = {
   toolCheckGiftCard,
   toolForwardReschedule,
   executeRespond,
+  sendPendingLookup,
+  emailQuestion,
   webCallbacks,
 };

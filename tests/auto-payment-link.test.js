@@ -56,7 +56,7 @@ const PHONE = '31611111111';
 function cartWithMassage(phone = PHONE) {
   conversations.set(phone, {
     lang: 'en',
-    customerEmail: 'guest@example.com',
+    customerEmail: 'guest@guest.fixture',
     customerName: 'Test Guest',
     pendingBookings: [{
       booking_event_id: 77,
@@ -122,7 +122,7 @@ describe('automatic payment link', () => {
     await advanceToAutoBill();
 
     expect(payments.createCombinedPaymentLink.mock.calls[0][0].customerEmail)
-      .toBe('guest@example.com');
+      .toBe('guest@guest.fixture');
   });
 
   test('a cart already billed by the model is left alone', async () => {
@@ -140,7 +140,7 @@ describe('automatic payment link', () => {
     cartWithMassage();
     scheduleAutoPaymentLink(PHONE);
 
-    await toolSendPayment(PHONE, { customer_email: 'guest@example.com' });
+    await toolSendPayment(PHONE, { customer_email: 'guest@guest.fixture' });
     expect(payments.createCombinedPaymentLink).toHaveBeenCalledTimes(1);
 
     await advanceToAutoBill();
@@ -186,7 +186,7 @@ describe('automatic payment link', () => {
 // journey-threshold.test.js; here it has to survive the actual billing path.
 describe('prepay threshold through the cart', () => {
   function setCart(items) {
-    conversations.set(PHONE, { lang: 'en', customerEmail: 'guest@example.com', pendingBookings: items });
+    conversations.set(PHONE, { lang: 'en', customerEmail: 'guest@guest.fixture', pendingBookings: items });
   }
   const cartItem = (sessionTypeId, name, cents, payOnLocation = false) => ({
     booking_event_id: sessionTypeId,

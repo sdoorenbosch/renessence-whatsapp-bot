@@ -30,7 +30,7 @@ beforeEach(() => jest.clearAllMocks());
 
 describe('every request emailed to the team also flags the guest as "needs reply"', () => {
   test('a reschedule request', async () => {
-    await toolForwardReschedule('31600000001', 'Anna', { new_date: 'Friday 16 Oct, afternoon', treatment: 'Float', customer_email: 'anna@example.com' });
+    await toolForwardReschedule('31600000001', 'Anna', { new_date: 'Friday 16 Oct, afternoon', treatment: 'Float', customer_email: 'anna@guest.fixture' });
     expect(db.markConversationEscalated).toHaveBeenCalledWith('31600000001', expect.stringMatching(/^Reschedule request: Float/));
   });
 
@@ -40,7 +40,7 @@ describe('every request emailed to the team also flags the guest as "needs reply
   });
 
   test('an old-system gift card', async () => {
-    await toolForwardGiftCard('31600000003', 'Cleo', { gift_card_number: 'OLD9', treatment: 'Facial', preferred_day: 'Monday', customer_email: 'c@example.com', old_system: true });
+    await toolForwardGiftCard('31600000003', 'Cleo', { gift_card_number: 'OLD9', treatment: 'Facial', preferred_day: 'Monday', customer_email: 'c@guest.fixture', old_system: true });
     expect(db.markConversationEscalated).toHaveBeenCalledWith('31600000003', 'Old gift card — transfer needed');
   });
 });

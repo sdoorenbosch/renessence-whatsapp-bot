@@ -27,12 +27,17 @@ const {
   toolCheckGiftCard,
   toolForwardReschedule,
   executeRespond,
+  sendPendingLookup,
+  emailQuestion,
   webCallbacks,
   closeUsedConfirmation,
   firstNameOf,
   sameGuestName,
 } = require('./tool-implementations');
 const { decodeInput } = require('./input-decoder');
+const { toHistory } = require('./team-context');
+const replyGuards = require('./reply-guards');
+const { rangeDays } = require('../utils/calendar');
 const db = require('../data/database');
 const outageAlert = require('../services/outage-alert.service');
 const introPromo = require('../services/intro-promo.service');
@@ -120,11 +125,11 @@ async function run(from, name, userMessage, opts = {}) {
           // The DB log is the truth and already holds any server message a
           // bare entry carries: replace instead of appending.
           conversationService.set(from, { messages: [] });
-          for (const row of rows) {
-            // 'team' messages are from Renessence staff — treat as assistant for OpenAI context
-            const role = (row.role === 'agent' || row.role === 'team') ? 'assistant' : row.role;
-            conversationService.addMessage(from, role, row.content);
-          }
+          // A colleague's messages ('team' / 'agent') come back as assistant
+          // turns labelled as written by staff, with their date (Tara, 4 Nov
+          // 2026: unlabelled, the bot took them for its own and contradicted
+          // them). Dashboard notes are left out.
+          for (const msg of toHistory(rows)) conversationService.addMessage(from, msg.role, msg.content);
           // A campaign intro sent right before this message is not an earlier
           // conversation: a brand-new guest must still get the AI welcome.
           restoredFromDb = rows.some(r => !introPromo.isPromoMessage(r.content, r.campaign_id));
@@ -142,8 +147,11 @@ async function run(from, name, userMessage, opts = {}) {
   // Close a confirmation gate that was used in a PREVIOUS turn. A fresh Confirm
   // tap resets bookingConfirmUsed in the handler, so this never eats a new tap.
   closeUsedConfirmation(from);
-  // A pay-first link is only ever delivered in the turn that created it.
-  conversationService.update(from, { payFirstLinkPending: null });
+  // A pay-first link is only ever delivered in the turn that created it, and
+  // a lookup's list only goes out in the turn that made it.
+  // The guest's own words in this turn: get_appointments falls back on them
+  // when the model leaves customer_expects empty (Tara, 19 Nov 2026).
+  conversationService.update(from, { payFirstLinkPending: null, lookupReply: null, turnGuestText: userMessage });
   const turnStartedAt = Date.now();
 
   // The guest's pay-first bookings (awaiting payment / paid / booked) — the
@@ -196,6 +204,56 @@ async function run(from, name, userMessage, opts = {}) {
   // next to any link created in the same turn.
   let bookingWithoutLinkThisTurn = false;
   let respondCount = 0;
+  // Handoff / reschedule / gift-card forwards that reached the team in this
+  // TURN. A bounced reply (below) gives the model another round, and it must
+  // not alert the team a second time. Only a forward that went through
+  // counts: after a refused one ("missing_details") the model has to be able
+  // to try again, or it would report something nobody received.
+  const TEAM_FORWARDS = new Set(['request_human_handoff', 'forward_gift_card_request', 'forward_reschedule_request']);
+  const forwardedThisTurn = new Set();
+  // Kinds of reply the guards already sent back once in this turn (reply-guards.js).
+  const bouncedKinds = new Set();
+  // The last reply sent back to the model. If the turn then ends without a
+  // new one (rounds used up on tool calls), this is still the guest's answer.
+  let bouncedReply = null;
+  // Touriya, 27 Sep 2026: with no email address to pass, the model made one
+  // up. That is refused now (email_required / companion_email_required), and
+  // the way on is to ASK the guest — so after such a refusal the booking calls
+  // of this turn are not run (each is told so), and if the turn ends without
+  // a reply the guest gets the question itself.
+  // One exception: in a LATER round, a call that names another name or
+  // address than the refused ones runs once more. The guest may have typed
+  // her address already and the model left it out; "no call at all" then
+  // asked her for it again. The server checks every address either way, and
+  // a second round of refusals closes the door for the rest of the turn.
+  const BOOKING_TOOLS = new Set(['book_appointment', 'book_class']);
+  let emailRefusal = null;        // the latest such refusal
+  let emailRefusalRound = -1;     // the round it came in
+  let emailRefusalRounds = 0;     // how many rounds had one
+  const refusedGuests = new Set();
+  const guestKey = (a) => `${String(a?.client_name || '').trim().toLowerCase()}|${String(a?.client_email || '').trim().toLowerCase()}`;
+  // Melanie, 23 Nov 2026: Wednesday's times went out six times as "Saturday,
+  // 25th November". What the weekday check (reply-guards.js) needs to know
+  // about this turn:
+  //  - did a write tool DO something (its result is not an error)? From then
+  //    on a reply is put right in code and never handed back: the round after
+  //    a bounce comes without that tool call, which broke the second payment
+  //    message of a two-person booking and let a handoff go out twice;
+  //  - which days this turn's check_availability calls fetched: a rewrite
+  //    that offers times under a day never fetched still carries the first
+  //    day's times;
+  //  - the reply that was handed back, per kind.
+  const WRITE_TOOLS = new Set(['book_appointment', 'book_class', 'cancel_appointments', 'send_payment', ...TEAM_FORWARDS]);
+  let wroteThisTurn = false;
+  // Tara, 19 Nov 2026: after a lookup the server's list replaces a plain
+  // reply — but not the reply that explains a booking, cancel or payment made
+  // in the same turn (any such call that ran, whatever its result).
+  const CHANGES_BOOKINGS = new Set(['book_appointment', 'book_class', 'cancel_appointments', 'send_payment']);
+  let changedBookingsThisTurn = false;
+  const respondOpts = () => ({ wroteThisTurn: changedBookingsThisTurn });
+  const checkedDays = new Set();
+  const heldBack = {};
+  const guardCtx = (extra) => ({ bounced: bouncedKinds, wrote: wroteThisTurn, checkedDays, held: heldBack, ...extra });
 
   for (let i = 0; i < MAX_ITERATIONS && !terminated; i++) {
     let response;
@@ -224,6 +282,26 @@ async function run(from, name, userMessage, opts = {}) {
       // must follow the link (or their next messages go unexplained).
       const linkSent = await deliverPendingPayFirstLink(from);
       if (linkSent && !failure.outage) return; // transient error: the link is the whole reply
+      // A reply this turn handed back for a rewrite still goes out — put right
+      // in code — instead of "Something went wrong" (found in review: a
+      // summary refused for its missing day, then a 429 on the next call, and
+      // the guest got no summary at all).
+      if (!linkSent && bouncedReply) {
+        const held = replyGuards.correctReply(from, bouncedReply, guardCtx());
+        bouncedReply = null;
+        await executeRespond(from, held, respondOpts());
+        await replyGuards.onRepeat(from, held, guardCtx());
+        replyGuards.onSent(from, held, guardCtx());
+        // On an outage the holding notice follows, as after a link — on
+        // WhatsApp; the website visitor's one answer was the reply.
+        if (!failure.outage || from.startsWith('web_')) return;
+      }
+      // A lookup's list from this turn still goes out, instead of "Something
+      // went wrong": the team may already have been told she was sent it
+      // (found in review: a 429 right after a needs_team lookup).
+      if (!linkSent && sendPendingLookup && await sendPendingLookup(from)) {
+        if (!failure.outage || from.startsWith('web_')) return;
+      }
       if (failure.outage && !failure.notifyCustomer) return; // told them within the last hour — don't answer every retry
       const errMsg = failure.outage
         ? outageAlert.holdingMessage(lang)
@@ -249,8 +327,12 @@ async function run(from, name, userMessage, opts = {}) {
     if (!assistantMsg.tool_calls || assistantMsg.tool_calls.length === 0) {
       // Shouldn't happen with tool_choice: required, but handle it
       if (assistantMsg.content) {
-        await whatsappService.sendText(from, assistantMsg.content);
-        conversationService.addMessage(from, 'assistant', assistantMsg.content);
+        // Plain text is put right like any reply (a wrong weekday, Melanie,
+        // 23 Nov 2026) — in code only: there is no respond call to hand back.
+        const text = replyGuards.correctReply(from, { message: assistantMsg.content, ui_type: 'none' }, { ...guardCtx(), held: {} }).message;
+        await whatsappService.sendText(from, text);
+        conversationService.addMessage(from, 'assistant', text);
+        bouncedReply = null; // the guest has an answer: a reply held back earlier stays unsent
       }
       break;
     }
@@ -265,7 +347,10 @@ async function run(from, name, userMessage, opts = {}) {
     // concurrently against Mindbody produced duplicate bookings / slot races.
     // We also drop exact-duplicate book_appointment calls within the same turn.
     if (otherCalls.length > 0) {
-      const READ_ONLY = new Set(['check_availability', 'lookup_client', 'get_appointments', 'check_class_schedule', 'check_gift_card']);
+      // get_appointments is not read-only any more: it can flag the chat,
+      // alert the team and keep the guest's list for the reply (Tara, 19 Nov
+      // 2026). Two lookups in parallel would race the "already notified" check.
+      const READ_ONLY = new Set(['check_availability', 'lookup_client', 'check_class_schedule', 'check_gift_card']);
 
       const runOne = async (tc) => {
         let args;
@@ -307,6 +392,18 @@ async function run(from, name, userMessage, opts = {}) {
       // Read-only tools: safe to parallelize.
       if (readCalls.length > 0) {
         collected.push(...await Promise.all(readCalls.map(runOne)));
+        // The days these availability checks fetched (see guardCtx). A call
+        // that was refused (its weekday), failed or stopped (repeated
+        // failures) fetched nothing.
+        for (const tc of readCalls) {
+          if (tc.function.name !== 'check_availability') continue;
+          const result = collected.find(c => c.id === tc.id)?.result;
+          if (!result || result.error || result.repeated_failure) continue;
+          let a;
+          try { a = JSON.parse(tc.function.arguments); } catch (_) { continue; }
+          const first = String(a?.start_date || '').slice(0, 10);
+          for (const day of rangeDays(first, String(a?.end_date || '').slice(0, 10) || first)) checkedDays.add(day);
+        }
       }
 
       // Mutating tools: sequential + de-duplicated.
@@ -379,7 +476,8 @@ async function run(from, name, userMessage, opts = {}) {
         const eurTotal = `€${total / 100}`;
         const threshold = `€${paymentService.JOURNEY_TEAM_THRESHOLD_CENTS / 100}`;
         logger.info(`Whole order of ${items.length + priorCount} treatments (${eurTotal}) for ${from} routed to the team before booking`);
-        const cartList = cart.map(b => `${b.service_name || b.session_type_id}${b.date_time_label ? ` ${b.date_time_label}` : ''}`).join('; ');
+        // when_label: the day in the chat language (date_time_label is the Stripe line item's).
+        const cartList = cart.map(b => `${b.service_name || b.session_type_id}${(b.when_label || b.date_time_label) ? ` ${b.when_label || b.date_time_label}` : ''}`).join('; ');
         // Unpaid pay-first links are NOT bookings: the handoff cancels them.
         const unpaid = replacing ? [] : pfRows.filter(r => r.status === 'awaiting_payment' && days.has(String(r.pay_first?.startDateTime || '').slice(0, 10)));
         const heldCount = Math.max(0, priorCount - unpaid.length);
@@ -395,7 +493,7 @@ async function run(from, name, userMessage, opts = {}) {
       })();
       for (const tc of writeCalls) {
         if (ONCE_PER_TURN.has(tc.function.name)) {
-          if (seenOnce.has(tc.function.name)) {
+          if (seenOnce.has(tc.function.name) || forwardedThisTurn.has(tc.function.name)) {
             logger.warn(`Skipping repeated ${tc.function.name} in same turn`);
             collected.push({ id: tc.id, result: { skipped: true, message: `${tc.function.name} already ran in this turn — do NOT call it again. Reply to the customer instead.` } });
             continue;
@@ -421,7 +519,32 @@ async function run(from, name, userMessage, opts = {}) {
             continue;
           }
         }
-        collected.push(await runOne(tc));
+        let bookingArgs = null;
+        if (BOOKING_TOOLS.has(tc.function.name)) {
+          try { bookingArgs = JSON.parse(tc.function.arguments); } catch (_) { bookingArgs = {}; }
+        }
+        if (emailRefusal && bookingArgs) {
+          const corrected = (bookingArgs.client_name || bookingArgs.client_email) && !refusedGuests.has(guestKey(bookingArgs));
+          if (emailRefusalRound === i || emailRefusalRounds >= 2 || !corrected) {
+            // Not run — and it says so. The first refusal can be about another
+            // person ("NOTHING was booked for Nadia") or the other tool; handed
+            // on word for word, the owner's own call read as if only Nadia's
+            // booking was missing.
+            collected.push({ id: tc.id, result: { ...emailRefusal, not_run: true, message: `This call was NOT run: an earlier booking call in this turn was refused because a name or email address is missing. Nothing was booked by this call either. After the customer has answered, send every booking call again. The earlier refusal: ${emailRefusal.message}` } });
+            continue;
+          }
+        }
+        const ran = await runOne(tc);
+        if (WRITE_TOOLS.has(tc.function.name) && ran.result && !ran.result.error) wroteThisTurn = true;
+        if (CHANGES_BOOKINGS.has(tc.function.name)) changedBookingsThisTurn = true;
+        if (TEAM_FORWARDS.has(tc.function.name) && ran.result?.sent === true) forwardedThisTurn.add(tc.function.name);
+        if (bookingArgs && ['email_required', 'companion_email_required'].includes(ran.result?.error)) {
+          if (emailRefusalRound !== i) emailRefusalRounds++;
+          emailRefusal = ran.result;
+          emailRefusalRound = i;
+          refusedGuests.add(guestKey(bookingArgs));
+        }
+        collected.push(ran);
       }
 
       for (const { id, result } of collected) {
@@ -447,11 +570,57 @@ async function run(from, name, userMessage, opts = {}) {
       }
       logger.info('Agent respond:', args.ui_type, args.message?.substring(0, 80));
       const pend = conversationService.get(from)?.payFirstLinkPending;
+      // Shanta, 1 Nov 2026: "we kunnen je afspraak verschuiven … flexibel" went
+      // out as a plain reply with no tool call. A reply a guard objects to is
+      // sent back to the model once; if the same objection returns, or the
+      // model writes no new reply before the turn ends (see after the loop),
+      // it goes out as written and the guard tells the team. Payment links
+      // are never held back: with a pay-first link pending the server's own
+      // message is the reply, and a cta_button reply is a payment link itself
+      // (WhatsApp and website chat alike).
+      let objection = null;
+      if (!pend && args.ui_type !== 'cta_button') {
+        objection = replyGuards.checkReply(from, args, guardCtx());
+        if (objection && !bouncedKinds.has(objection.kind)) {
+          bouncedKinds.add(objection.kind);
+          bouncedReply = args;
+          heldBack[objection.kind] = { args };
+          replyGuards.onBounce(from, args, objection, guardCtx());
+          logger.warn(`[${from}] reply not sent (${objection.error}) — asking the model to rewrite it`);
+          messages.push({ role: 'tool', tool_call_id: respondCall.id, content: JSON.stringify({ sent: false, error: objection.error, message: objection.message }) });
+          // The turn goes on, so EVERY respond call of this model message
+          // needs a result: the model API rejects the next request otherwise
+          // and the guest would get "Something went wrong". (Only the first
+          // respond call is ever sent; until the bounce existed the turn
+          // ended there and the others never needed an answer.)
+          for (const tc of assistantMsg.tool_calls) {
+            if (tc.function.name !== 'respond' || tc.id === respondCall.id) continue;
+            messages.push({ role: 'tool', tool_call_id: tc.id, content: JSON.stringify({ sent: false, error: 'one_reply_per_message', message: 'Not sent: put the whole reply in ONE respond call.' }) });
+          }
+          continue;
+        }
+      }
       if (bookingWithoutLinkThisTurn && pend && !pend.alsoSendModelText) {
         conversationService.update(from, { payFirstLinkPending: { ...pend, alsoSendModelText: true } });
       }
-      await executeRespond(from, args);
+      // Melanie, 23 Nov 2026: what goes out never carries a weekday that does
+      // not match its date. A reply that is not handed back (a payment link, a
+      // reply sent with a booking, one that was handed back already) is put
+      // right in code — the text only: a link and its button stay as they are,
+      // and the server's own pay-first message is not the model's text and is
+      // never touched. What is sent here is also what is stored and logged.
+      // (quiet: with a pay-first link pending only the server's message goes
+      // out, so a correction of the model's text is not logged as sent.)
+      const modelTextGoesOut = !pend || pend.alsoSendModelText || bookingWithoutLinkThisTurn || from.startsWith('web_');
+      args = replyGuards.correctReply(from, args, guardCtx({ quiet: !modelTextGoesOut }));
+      await executeRespond(from, args, respondOpts());
       respondCount++;
+      bouncedReply = null;
+      if (objection) await replyGuards.onRepeat(from, args, guardCtx());
+      // (With a pay-first link pending the server's message is the reply; the
+      // model's text only goes out next to it when another booking of this
+      // turn made no link.)
+      if (!pend || pend.alsoSendModelText || bookingWithoutLinkThisTurn) replyGuards.onSent(from, args, guardCtx());
 
       // Only allow a second payment CTA if a NEW book_appointment also happened
       // in this same turn. Without a new booking there is nothing to link to,
@@ -477,6 +646,39 @@ async function run(from, name, userMessage, opts = {}) {
 
   // A payment link created this turn that no reply carried: send it anyway.
   if (await deliverPendingPayFirstLink(from)) terminated = true;
+
+  // A reply was sent back for a rewrite and the model never wrote a new one
+  // (found in review: handoff alone in the last round). The guest gets that
+  // reply and the guard tells the team — not the "no availability" text
+  // below, which answers a question nobody asked. A wrong weekday in it is
+  // put right in code first (Melanie, 23 Nov 2026).
+  if (!terminated && bouncedReply) {
+    logger.warn(`[${from}] no rewritten reply before the turn ended — sending the reply that was held back`);
+    const held = replyGuards.correctReply(from, bouncedReply, guardCtx());
+    await executeRespond(from, held, respondOpts());
+    await replyGuards.onRepeat(from, held, guardCtx());
+    replyGuards.onSent(from, held, guardCtx());
+    terminated = true;
+  }
+
+  // A booking was refused for a missing email address or name and the model
+  // never asked for it: ask the guest ourselves — not the "no availability"
+  // text below. Sent like any reply, so it is stored (memory and dashboard)
+  // and the next turn sees what was asked.
+  if (!terminated && emailRefusal) {
+    logger.warn(`[${from}] turn ended after ${emailRefusal.error} without a reply — sending the question`);
+    await executeRespond(from, { message: emailQuestion(conversationService.get(from)?.lang || 'en', emailRefusal), ui_type: 'none' }, respondOpts());
+    terminated = true;
+  }
+
+  // A lookup ran and the model never replied (rounds used up): the guest
+  // still gets the server's list — not the "no availability" text below
+  // (Tara, 19 Nov 2026; the team may already have been told to check).
+  if (!terminated && conversationService.get(from)?.lookupReply) {
+    logger.warn(`[${from}] turn ended after a lookup without a reply — sending the list`);
+    await sendPendingLookup(from);
+    terminated = true;
+  }
 
   if (!terminated) {
     logger.error('Agent loop exhausted without respond for', from);

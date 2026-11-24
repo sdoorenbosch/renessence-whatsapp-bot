@@ -87,8 +87,8 @@ async function sendReminderIfNotSent(appointment, type) {
   let message;
   if (type === '24h') {
     message = lang === 'nl'
-      ? `Herinnering: Overmorgen heb je een afspraak voor *${service}* om ${timeStr} op ${dateStr}.\n\n📍 ${address}\n\n_Annuleren is gratis tot 24 uur voor aanvang. Bij annulering binnen 24 uur of no-show wordt 100% van de sessiekosten in rekening gebracht._`
-      : `Reminder: You have an appointment for *${service}* at ${timeStr} on ${dateStr}.\n\n📍 ${address}\n\n_Cancellations are free of charge up to 24 hours before your appointment. Cancellations within 24 hours or no-shows will be charged 100% of the session fee._`;
+      ? `Herinnering: Overmorgen heb je een afspraak voor *${service}* om ${timeStr} op ${dateStr}.\n\n📍 ${address}\n\n_Annuleren of verzetten is gratis tot 24 uur voor aanvang. Bij annuleren of verzetten binnen 24 uur of bij no-show wordt 100% van de sessiekosten in rekening gebracht._`
+      : `Reminder: You have an appointment for *${service}* at ${timeStr} on ${dateStr}.\n\n📍 ${address}\n\n_Cancelling or rescheduling is free of charge up to 24 hours before your appointment. Within 24 hours, and for no-shows, 100% of the session fee is charged._`;
   } else {
     message = lang === 'nl'
       ? `Over 2 uur begint je afspraak voor *${service}* om ${timeStr}. We zien je graag! 🙏\n\n📍 ${address}`

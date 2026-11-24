@@ -448,7 +448,7 @@ function scheduleReminder(from, rowId, sessionId, mintedAtMs) {
  * this function once the row carries its session id (a link the DB doesn't
  * know must never reach a guest).
  */
-async function startCheckout({ from, clientId, customerName, customerEmail, sessionTypeId, serviceName, startDateTime, staffId, staffName, staffRequested, roomId, notes, forNote = null, amountCents, lang }) {
+async function startCheckout({ from, clientId, customerName, customerEmail, sessionTypeId, serviceName, startDateTime, staffId, staffName, staffRequested, roomId, notes, forNote = null, emailNote = null, amountCents, lang }) {
   const payFirst = {
     clientId: String(clientId),
     sessionTypeId: Number(sessionTypeId),
@@ -459,6 +459,8 @@ async function startCheckout({ from, clientId, customerName, customerEmail, sess
     roomId: roomId ? Number(roomId) : null,
     notes: notes || null,
     forNote: forNote || null,
+    // Only when there is one: every other row stays exactly as it was.
+    ...(emailNote ? { emailNote } : {}),
     lang: lang || 'en',
     customerEmail: customerEmail || null,
     customerName: customerName || null,
@@ -524,6 +526,11 @@ async function waitForInFlight(maxMs = 20000) {
 function paidNote(row, extraNotes) {
   const parts = [BOT_TAG, `✅ PAID online €${eur(row.amount_cents)} (Stripe, ${new Date().toISOString().slice(0, 10)})`];
   if (row.pay_first?.forNote) parts.push(row.pay_first.forNote);
+  // "Email: <address>" — what a guest gave when their Mindbody profile has no
+  // real address (Touriya, 27 Sep 2026). On its own, never inside the model's
+  // notes: the add-on rule below reads "led" anywhere in those, and a paid
+  // massage for khaled@… came out as "NOT paid online, collect at reception".
+  if (row.pay_first?.emailNote) parts.push(row.pay_first.emailNote);
   if (extraNotes) {
     // The LED add-on is requested in the notes but not part of the online price.
     parts.push(/LED/i.test(extraNotes) ? `${extraNotes} — NOT paid online, collect at reception` : extraNotes);

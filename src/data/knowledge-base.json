@@ -46,13 +46,14 @@
 
   "policies": {
     "cancellation": {
-      "free_cancel_window": "Gratis annuleren tot 24 uur voor je afspraak.",
-      "late_cancel_or_no_show": "Bij annulering binnen 24 uur of no-show worden de volledige kosten in rekening gebracht (100%). Geen restitutie of credits.",
-      "how_to_reschedule_or_cancel": "Reschedulen of annuleren doe je via je Guest Profile (gastaccount) op de website. Na het annuleren van je bestaande afspraak kun je zelf een nieuwe boeking maken. Lukt het niet, mail dan welcome@renessence.com.",
+      "free_cancel_window": "Gratis annuleren of verzetten tot 24 uur voor je afspraak.",
+      "late_cancel_or_no_show": "Bij annuleren of verzetten binnen 24 uur voor aanvang, en bij no-show, worden de volledige kosten in rekening gebracht (100%). Geen restitutie of credits.",
+      "late_change_options": "Binnen 24 uur mag iemand anders in jouw plaats komen. Bij ziekte of een medisch noodgeval kun je een medisch bewijs aanleveren om een uitzondering aan te vragen; alleen het team beslist daarover.",
+      "how_to_reschedule_or_cancel": "Tot 24 uur voor aanvang: verzetten of annuleren doe je via je Guest Profile (gastaccount) op de website; na het annuleren van je bestaande afspraak kun je zelf een nieuwe boeking maken. Binnen 24 uur gelden de volledige kosten; over een uitzondering beslist alleen het team. Lukt het niet, mail dan welcome@renessence.com.",
       "how_to_cancel": "Via je Guest Profile (gastaccount) op de website, of via e-mail welcome@renessence.com.",
-      "refund": "Een afspraak annuleren geeft niet automatisch recht op terugbetaling. Eventuele restitutie wordt behandeld volgens ons annuleringsbeleid. Bij annulering binnen 24 uur en no-shows wordt het volledige sessietarief in rekening gebracht. Voor de status van een specifieke terugbetaling: neem contact op met welcome@renessence.com.",
+      "refund": "Een afspraak annuleren geeft niet automatisch recht op terugbetaling. Eventuele restitutie wordt behandeld volgens ons annuleringsbeleid. Bij annuleren of verzetten binnen 24 uur en bij no-shows wordt het volledige sessietarief in rekening gebracht. Voor de status van een specifieke terugbetaling: neem contact op met welcome@renessence.com.",
       "deduction_from_credits": "Bij geen prepayment kan Renessence kosten afhouden van credits, loyaltypunten of cadeaubonnen.",
-      "credit_on_cancel": "Wanneer je een afspraak annuleert, krijg je de exacte behandelingen die geboekt waren terug als treatment credits — NIET als geld terug op je cadeaubon. Je kunt de gecrediteerde behandeling daarna op elk gewenst beschikbaar tijdstip opnieuw boeken via je gastaccount."
+      "credit_on_cancel": "Wanneer je een afspraak uiterlijk 24 uur voor aanvang annuleert, krijg je de exacte behandelingen die geboekt waren terug als treatment credits — NIET als geld terug op je cadeaubon. Je kunt de gecrediteerde behandeling daarna op elk gewenst beschikbaar tijdstip opnieuw boeken via je gastaccount. Bij annuleren binnen 24 uur of no-show: geen credits."
     },
     "late_arrival": {
       "policy": "Let op: als je te laat komt voor je afspraak, kan het zijn dat we de behandeltijd daarop moeten aanpassen, zodat we alle geplande afspraken kunnen laten doorgaan.",
@@ -83,7 +84,7 @@
     "Health Intake formulier is verplicht voor behandelingen en dient elke 3 maanden te worden bijgewerkt.",
     "Alleen Renessence-medewerkers mogen behandelingen uitvoeren en apparatuur bedienen.",
     "Stilte in aangewezen gebieden. Telefoon op stil. Geen persoonlijke muziek.",
-    "Schoeisel verplicht in openbare ruimtes. Slippers zijn verkrijgbaar bij de receptie.",
+    "Schoeisel verplicht in openbare ruimtes. Slippers zijn niet inbegrepen: neem je eigen slippers mee of koop een paar bij de receptie voor €4,50.",
     "Gepaste kleding / badjas verplicht in alle openbare ruimtes.",
     "Douchen verplicht voor Infrared Sauna en Sensory Deprivation Float.",
     "Geen persoonlijke foto's van gasten of medewerkers zonder toestemming. Camera verboden in kleedkamers.",
@@ -429,10 +430,10 @@
 
   "faq": {
     "what_is_renessence": "Renessence is een ruimte voor beweging en herstel, ontworpen om je zenuwstelsel, energie en focus te ondersteunen. Naast een gym biedt het treatments: Hyperbaric Oxygen Hydroxy, Infrared Sauna, massages, floating, Red Light Therapy en facials.",
-    "what_to_bring": "Slippers en een waterfles. Handdoek en badjas worden verstrekt.",
+    "what_to_bring": "Neem je eigen slippers en een waterfles mee. Een handdoek en badjas krijg je van ons. Slippers zijn niet inbegrepen: wie ze niet bij zich heeft, koopt een paar bij de receptie voor €4,50.",
     "arrival_time": "Kom 10-15 minuten voor je behandeling. Reserve meer agenda-tijd voor omkleden, douchen en relaxen in de lounge.",
     "can_shower_after": "Ja, er is tijd om te douchen na de sessie.",
-    "cancellation": "Gratis annuleren tot 24 uur voor de afspraak. Daarna 100% in rekening gebracht. No-show = 100%.",
+    "cancellation": "Gratis annuleren of verzetten tot 24 uur voor de afspraak. Daarna wordt 100% in rekening gebracht, ook bij verzetten. No-show = 100%. Binnen 24 uur mag iemand anders in jouw plaats komen; bij ziekte of een medisch noodgeval kun je met een medisch bewijs een uitzondering aanvragen — het team beslist.",
     "pregnancy": "Sommige behandelingen zijn niet geschikt tijdens zwangerschap. Raadpleeg je arts en neem contact op voor het boeken.",
     "medical_health": "Bij boeking bevestig je dat je geen medische aandoeningen hebt die de behandeling onveilig maken. Vul altijd het Health Intake formulier in.",
     "can_i_bring_guest": "Ja, gasten kunnen losse sessies boeken. Heat Reset 2-persoons lid mag altijd een ander (wisselend) persoon meenemen.",
@@ -450,7 +451,7 @@
     "additional_experiences_membership": "Floating, Yoga, Creative Space en Studio zijn beschikbaar als extra, buiten de membership voor een meerprijs.",
     "loyalty_points_check": "Log in op je account en ga naar het 'loyalty points' tabblad, of neem contact op via welcome@renessence.com.",
     "gift_card_online_issue": "Neem contact op via welcome@renessence.com met je kaartnummer en gewenste service.",
-    "cancellation_credit": "Wanneer je een afspraak annuleert (binnen de gratis annuleringsperiode van 24 uur), worden de exacte behandelingen die geboekt waren terug gecrediteerd als treatment credits op je account. Het geld gaat NIET terug op je cadeaubon. Je kunt de gecrediteerde behandelingen daarna gewoon opnieuw boeken via je gastaccount op elk beschikbaar tijdstip — kies dezelfde behandelingen als in je originele boeking.",
+    "cancellation_credit": "Wanneer je een afspraak uiterlijk 24 uur voor aanvang annuleert (de gratis annuleringsperiode), worden de exacte behandelingen die geboekt waren terug gecrediteerd als treatment credits op je account. Het geld gaat NIET terug op je cadeaubon. Je kunt de gecrediteerde behandelingen daarna gewoon opnieuw boeken via je gastaccount op elk beschikbaar tijdstip — kies dezelfde behandelingen als in je originele boeking. Bij annuleren binnen 24 uur of no-show worden geen credits teruggezet.",
     "treatment_order_oxygen_sauna": "Voor je hyperbaric oxygen hydrogen sessie is het beter om geen intensieve inspanning of hittebehandelingen direct vóór de zuurstoftherapie te doen. Om het risico op oververhitting te beperken en de treatment optimaal te laten werken, wordt doorgaans aangeraden om eerst de Hyperbaric Oxygen Hydrogen (zuurstoftherapie) te doen en daarna pas de Infrared of Finse Sauna. Op die manier ben je beter gehydrateerd en fysiologisch stabieler vóórdat je warmtebelasting toevoegt. Dit kan bijdragen aan een comfortabelere ervaring en een beter afgestemde totale sessie."
   }
 }

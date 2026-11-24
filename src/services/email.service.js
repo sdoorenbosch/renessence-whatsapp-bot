@@ -6,6 +6,14 @@ const logger = require('../utils/logger');
 const settings = require('./settings.service');
 
 // H3: prevent HTML injection from customer-supplied data
+// Melanie, 23 Nov 2026: the day in a forwarded request is the model's wording
+// ("Saturday 25 November" for a Wednesday). When code found something to check
+// in it, the note goes into the email as a row of its own (tool-implementations.js,
+// dateCheckNote); without a note the emails are exactly as they were.
+const dateCheckRow = (dateNote) => (dateNote
+  ? `<tr><td style="padding:8px; font-weight:bold; vertical-align:top;">Date check</td><td style="padding:8px; background:#FFF8E1;">⚠️ ${escapeHtml(dateNote)}</td></tr>`
+  : '');
+
 function escapeHtml(str) {
   if (!str) return '';
   return String(str)
@@ -90,7 +98,7 @@ async function sendMail({ to, subject, html, text, attachments }) {
 /**
  * Send escalation email to the team
  */
-async function sendEscalationEmail({ customerName, customerPhone, customerEmail, message, conversationHistory }) {
+async function sendEscalationEmail({ customerName, customerPhone, customerEmail, message, conversationHistory, dateNote }) {
   const toEmail = settings.teamInbox();
 
   const subject = `WhatsApp Escalation - ${escapeHtml(customerName || customerPhone)}`;
@@ -100,7 +108,7 @@ async function sendEscalationEmail({ customerName, customerPhone, customerEmail,
       <tr><td style="padding:8px; font-weight:bold;">Name:</td><td style="padding:8px;">${escapeHtml(customerName || 'Unknown')}</td></tr>
       <tr><td style="padding:8px; font-weight:bold;">Phone (WhatsApp):</td><td style="padding:8px;"><a href="https://wa.me/${escapeHtml(customerPhone)}">+${escapeHtml(customerPhone)}</a></td></tr>
       ${customerEmail ? `<tr><td style="padding:8px; font-weight:bold;">Email:</td><td style="padding:8px;"><a href="mailto:${escapeHtml(customerEmail)}">${escapeHtml(customerEmail)}</a></td></tr>` : ''}
-      <tr><td style="padding:8px; font-weight:bold;">Message:</td><td style="padding:8px;">${escapeHtml(message || 'Requested human assistance')}</td></tr>
+      <tr><td style="padding:8px; font-weight:bold;">Message:</td><td style="padding:8px;">${escapeHtml(message || 'Requested human assistance')}</td></tr>${dateCheckRow(dateNote)}
     </table>
     ${conversationHistory ? `<h3>Recent conversation</h3><pre style="background:#f5f5f5; padding:12px; border-radius:4px;">${escapeHtml(conversationHistory)}</pre>` : ''}
     <p style="color:#888; font-size:12px;">Sent by Renessence WhatsApp Bot</p>
@@ -162,7 +170,7 @@ async function sendBookingConfirmationEmail({ customerEmail, customerName, servi
         <p style="color:#555; font-size:14px; line-height:1.6;">We kindly advise arriving 5 minutes early to settle in comfortably. Please note that your arrival time <strong>includes preparation time</strong>.</p>
         <p style="color:#555; font-size:14px; line-height:1.6;">At Renessence we will provide bathrobes and towels. You are welcome to bring your water bottle and slippers, or purchase them at reception.</p>
 
-        <p style="color:#555; font-size:14px; line-height:1.6; margin-top:24px;">Cancellations are free of charge up to 24 hours before the scheduled start time. Cancellations made within 24 hours or no-shows will be charged 100% of the session fee.</p>
+        <p style="color:#555; font-size:14px; line-height:1.6; margin-top:24px;">Cancelling or rescheduling is free of charge up to 24 hours before your appointment. Within 24 hours, and for no-shows, 100% of the session fee is charged.</p>
 
         <p style="color:#555; font-size:14px; line-height:1.6; margin-top:24px;">We look forward to welcoming you soon!</p>
 
@@ -198,7 +206,7 @@ async function sendBookingConfirmationEmail({ customerEmail, customerName, servi
 /**
  * Notify welcome team that a booking was cancelled via WhatsApp bot
  */
-async function sendCancellationNotificationEmail({ customerName, customerPhone, serviceName, dateTime, isWithin24h, isReschedule, statusNote }) {
+async function sendCancellationNotificationEmail({ customerName, customerPhone, serviceName, dateTime, isWithin24h, isReschedule, statusNote, dateNote }) {
   const toEmail = settings.teamInbox();
   const subject = `Cancellation — ${escapeHtml(customerName || customerPhone)} — ${escapeHtml(serviceName || 'Unknown treatment')}`;
   const withinLabel = isWithin24h ? ' (within 24h — no refund per policy)' : ' (outside 24h)';
@@ -215,7 +223,7 @@ async function sendCancellationNotificationEmail({ customerName, customerPhone, 
         <tr><td style="padding:8px; font-weight:bold; border-bottom:1px solid #eee;">Phone (WhatsApp)</td><td style="padding:8px; border-bottom:1px solid #eee;"><a href="https://wa.me/${escapeHtml(customerPhone)}">+${escapeHtml(customerPhone)}</a></td></tr>
         <tr><td style="padding:8px; font-weight:bold; border-bottom:1px solid #eee;">Service</td><td style="padding:8px; border-bottom:1px solid #eee;">${escapeHtml(serviceName || 'Unknown')}</td></tr>
         <tr><td style="padding:8px; font-weight:bold; border-bottom:1px solid #eee;">Date / Time</td><td style="padding:8px; border-bottom:1px solid #eee;">${escapeHtml(dateTime || 'Unknown')}</td></tr>
-        <tr><td style="padding:8px; font-weight:bold;">Type</td><td style="padding:8px;">${escapeHtml(typeLabel)}</td></tr>
+        <tr><td style="padding:8px; font-weight:bold;">Type</td><td style="padding:8px;">${escapeHtml(typeLabel)}</td></tr>${dateCheckRow(dateNote)}
       </table>
       <p style="color:#888; font-size:12px; margin-top:24px;">Sent automatically by Renessence WhatsApp Bot</p>
     </div>
@@ -266,7 +274,7 @@ async function sendRefundNotificationEmail({ customerName, customerPhone, servic
  * redeem gift cards (that needs Mindbody POS), so it collects the details and
  * the team makes the booking by hand.
  */
-async function sendGiftCardRequestEmail({ customerName, customerPhone, customerEmail, giftCardNumber, treatment, preferredDay, oldSystem }) {
+async function sendGiftCardRequestEmail({ customerName, customerPhone, customerEmail, giftCardNumber, treatment, preferredDay, oldSystem, dateNote }) {
   const toEmail = settings.teamInbox();
   const subject = oldSystem
     ? `OLD Gift Card — Manual Transfer Needed — ${escapeHtml(customerName || customerPhone)}`
@@ -291,7 +299,7 @@ async function sendGiftCardRequestEmail({ customerName, customerPhone, customerE
         ${customerEmail ? `<tr><td style="padding:8px; font-weight:bold; border-bottom:1px solid #eee;">Email</td><td style="padding:8px; border-bottom:1px solid #eee;"><a href="mailto:${escapeHtml(customerEmail)}">${escapeHtml(customerEmail)}</a></td></tr>` : ''}
         <tr><td style="padding:8px; font-weight:bold; border-bottom:1px solid #eee;">Gift card number</td><td style="padding:8px; border-bottom:1px solid #eee;">${escapeHtml(giftCardNumber)}</td></tr>
         <tr><td style="padding:8px; font-weight:bold; border-bottom:1px solid #eee;">Treatment</td><td style="padding:8px; border-bottom:1px solid #eee;">${escapeHtml(treatment)}</td></tr>
-        <tr><td style="padding:8px; font-weight:bold;">Preferred day / time</td><td style="padding:8px;">${escapeHtml(preferredDay)}</td></tr>
+        <tr><td style="padding:8px; font-weight:bold;">Preferred day / time</td><td style="padding:8px;">${escapeHtml(preferredDay)}</td></tr>${dateCheckRow(dateNote)}
       </table>
       <p style="color:#888; font-size:12px; margin-top:24px;">Sent automatically by Renessence WhatsApp Bot</p>
     </div>
@@ -312,7 +320,7 @@ async function sendGiftCardRequestEmail({ customerName, customerPhone, customerE
  * itself; it collects the desired new date + treatment + email and the team
  * arranges the move in Mindbody.
  */
-async function sendRescheduleRequestEmail({ customerName, customerPhone, customerEmail, newDate, treatment, currentAppointment }) {
+async function sendRescheduleRequestEmail({ customerName, customerPhone, customerEmail, newDate, treatment, currentAppointment, dateNote }) {
   const toEmail = settings.teamInbox();
   const subject = `Reschedule Request — ${escapeHtml(customerName || customerPhone)}`;
   const html = `
@@ -325,7 +333,7 @@ async function sendRescheduleRequestEmail({ customerName, customerPhone, custome
         ${customerEmail ? `<tr><td style="padding:8px; font-weight:bold; border-bottom:1px solid #eee;">Email</td><td style="padding:8px; border-bottom:1px solid #eee;"><a href="mailto:${escapeHtml(customerEmail)}">${escapeHtml(customerEmail)}</a></td></tr>` : ''}
         ${currentAppointment ? `<tr><td style="padding:8px; font-weight:bold; border-bottom:1px solid #eee;">Current appointment</td><td style="padding:8px; border-bottom:1px solid #eee;">${escapeHtml(currentAppointment)}</td></tr>` : ''}
         <tr><td style="padding:8px; font-weight:bold; border-bottom:1px solid #eee;">Treatment</td><td style="padding:8px; border-bottom:1px solid #eee;">${escapeHtml(treatment)}</td></tr>
-        <tr><td style="padding:8px; font-weight:bold;">Desired new date/time</td><td style="padding:8px;">${escapeHtml(newDate)}</td></tr>
+        <tr><td style="padding:8px; font-weight:bold;">Desired new date/time</td><td style="padding:8px;">${escapeHtml(newDate)}</td></tr>${dateCheckRow(dateNote)}
       </table>
       <p style="color:#888; font-size:12px; margin-top:24px;">Sent automatically by Renessence WhatsApp Bot</p>
     </div>
