@@ -101,7 +101,7 @@ const tools = require('../src/agents/tool-implementations');
 const PHONE = '31611111111';
 const OTHER = '31699999999';
 const MASSAGE_60 = 31;
-const CLIENT = { Id: 7, FirstName: 'Sanne', LastName: 'de Vries', Email: 'sanne@example.com' };
+const CLIENT = { Id: 7, FirstName: 'Sanne', LastName: 'de Vries', Email: 'sanne@guest.fixture' };
 
 const pad = (n) => String(n).padStart(2, '0');
 /** A naive local datetime `minutes` from now, on a 5-minute grid. */
@@ -277,7 +277,7 @@ describe('review round: link delivery, replace, deadlines', () => {
   test('a link closed later in the same turn (handoff) never goes out; the model\'s reply does', async () => {
     await bookAndPayLink();
     payments.getSessionDetails.mockResolvedValueOnce({ status: 'expired', paymentStatus: 'unpaid' });
-    await tools.toolHumanHandoff(PHONE, 'Sanne', { reason: 'Order of €150+', customer_email: 'sanne@example.com' });
+    await tools.toolHumanHandoff(PHONE, 'Sanne', { reason: 'Order of €150+', customer_email: 'sanne@guest.fixture' });
     await tools.executeRespond(PHONE, { message: 'Our team will arrange it for you.', ui_type: 'none' });
     expect(whatsapp.sendCTAButton).not.toHaveBeenCalled();
     expect(whatsapp.sendText).toHaveBeenCalledWith(PHONE, 'Our team will arrange it for you.');
@@ -432,17 +432,35 @@ describe('a second guest at the same time (pay-first)', () => {
     mockRows.get(501).status = 'paid';
     mockRows.get(501).pay_first.customerName = 'Sanne de Vries';
     confirmedAndOffered(START);
-    const r = await tools.toolBookAppointment(PHONE, { session_type_id: MASSAGE_60, start_date_time: START, staff_id: 6, client_name: 'Nathalie Link', client_email: 'nathalie@example.com' });
+    const r = await tools.toolBookAppointment(PHONE, { session_type_id: MASSAGE_60, start_date_time: START, staff_id: 6, client_name: 'Nathalie Link', client_email: 'nathalie@guest.fixture' });
     expect(r.error).toBe('second_guest_needs_team');
     expect(payments.createPayFirstCheckout).toHaveBeenCalledTimes(1);
   });
+  // Touriya review, Nov 2026: the open-link check only gets an address the
+  // guest typed or we hold for the number. A booking paid before that rule has
+  // nothing stored — but its own row carries the address the server used.
+  test('the owner under her WhatsApp nickname re-sends a booking she PAID before addresses were checked: "already paid", not "a second guest"', async () => {
+    mindbody.getClientByPhone.mockResolvedValue({ Id: 7, FirstName: 'Susanne', LastName: 'de Vries', Email: 'susanne@guest.fixture' });
+    await bookAndPayLink();
+    expect(mockRows.get(501)).toMatchObject({ customer_name: 'Susanne de Vries' });
+    expect(mockRows.get(501).pay_first.customerEmail).toBe('susanne@guest.fixture');
+    mockRows.get(501).status = 'paid';
+    // Days later: memory gone, she never typed that address, the model sends her WhatsApp name.
+    conversations.clear(PHONE);
+    conversations.set(PHONE, { lang: 'en', userName: 'Sanne' });
+    const r = await tools.toolBookAppointment(PHONE, { session_type_id: MASSAGE_60, start_date_time: START, staff_id: 5, client_name: 'Sanne', client_email: 'susanne@guest.fixture' });
+    expect(r).toMatchObject({ success: true, already_paid: true });
+    expect(r.error).toBeUndefined();
+    expect(payments.createPayFirstCheckout).toHaveBeenCalledTimes(1);
+  });
+
   test('a friend using the owner\'s email at the owner\'s paid time is still a second guest', async () => {
     await bookAndPayLink();
     Object.assign(mockRows.get(501), { status: 'paid' });
     mockRows.get(501).pay_first.customerName = 'Sanne de Vries';
-    mockRows.get(501).pay_first.customerEmail = 'sanne@example.com';
+    mockRows.get(501).pay_first.customerEmail = 'sanne@guest.fixture';
     confirmedAndOffered(START);
-    const r = await tools.toolBookAppointment(PHONE, { session_type_id: MASSAGE_60, start_date_time: START, staff_id: 6, client_name: 'Nathalie Link', client_email: 'sanne@example.com' });
+    const r = await tools.toolBookAppointment(PHONE, { session_type_id: MASSAGE_60, start_date_time: START, staff_id: 6, client_name: 'Nathalie Link', client_email: 'sanne@guest.fixture' });
     expect(r.error).toBe('second_guest_needs_team');
     expect(r.already_paid).toBeUndefined();
   });
@@ -506,7 +524,7 @@ describe('guard: what the guest already has (runs before the Confirm gate)', () 
   test('a handoff to the team cancels an unpaid link', async () => {
     await bookAndPayLink();
     payments.getSessionDetails.mockResolvedValueOnce({ status: 'expired', paymentStatus: 'unpaid' });
-    const r = await tools.toolHumanHandoff(PHONE, 'Sanne', { reason: 'wants to pay at reception', customer_email: 'sanne@example.com' });
+    const r = await tools.toolHumanHandoff(PHONE, 'Sanne', { reason: 'wants to pay at reception', customer_email: 'sanne@guest.fixture' });
     expect(r.payment_link_cancelled).toEqual(['Tailored Massage 60 min']);
     expect(mockRows.get(501).status).toBe('expired');
   });
@@ -529,6 +547,25 @@ describe('after payment', () => {
     expect(mockRows.get(501)).toMatchObject({ status: 'paid', mindbody_appointment_id: 9100, stripe_payment_intent: 'pi_cs_1' });
     expect(whatsapp.sendText).toHaveBeenCalledWith(PHONE, expect.stringMatching(/Payment received ✅[\s\S]*is booked/));
     expect(db.logMessage).toHaveBeenCalledWith(PHONE, 'assistant', expect.stringMatching(/is booked/));
+  });
+
+  // Touriya review, Nov 2026: the address a guest gave for a profile without
+  // one was merged into the model's notes — and the add-on rule below reads
+  // "led" in any of it: a paid massage for khaled@… got "NOT paid online,
+  // collect at reception".
+  test('the address a guest gave for a profile without one stands on the PAID note as it is — never read as an unpaid add-on', async () => {
+    mindbody.getClientByPhone.mockResolvedValue({ ...CLIENT, Email: 'sanne@example.com' });
+    conversations.addMessage(PHONE, 'user', 'khaled.fixture@guest.fixture');
+    confirmedAndOffered(START);
+    const r = await tools.toolBookAppointment(PHONE, { session_type_id: MASSAGE_60, start_date_time: START, staff_id: 5, client_email: 'khaled.fixture@guest.fixture' });
+    expect(r).toMatchObject({ success: true, payFirst: true });
+    await payFirst.handlePaid(paidSession('cs_1'));
+    await flush();
+    const { notes } = mindbody.addAppointment.mock.calls[0][0];
+    expect(notes).toMatch(/✅ PAID online €130/);
+    expect(notes).toContain('| Email: khaled.fixture@guest.fixture |');
+    expect(notes).not.toMatch(/NOT paid online/);
+    expect(notes).not.toMatch(/collect at reception/);
   });
 
   test('a duplicate delivery does nothing', async () => {

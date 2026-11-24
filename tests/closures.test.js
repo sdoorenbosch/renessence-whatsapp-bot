@@ -100,7 +100,7 @@ describe('check_availability', () => {
 
 describe('book_appointment', () => {
   test('refuses a closed day before touching Mindbody', async () => {
-    const res = await toolBookAppointment(PHONE, { session_type_id: FLOAT, start_date_time: '2026-12-25T10:00:00', client_name: 'Ann Smit', client_email: 'ann@example.com' });
+    const res = await toolBookAppointment(PHONE, { session_type_id: FLOAT, start_date_time: '2026-12-25T10:00:00', client_name: 'Ann Smit', client_email: 'ann@guest.fixture' });
     expect(res.error).toBe('closed');
     expect(res.message).toMatch(/Christmas/);
     expect(mindbody.getClientByPhone).not.toHaveBeenCalled();
@@ -110,13 +110,13 @@ describe('book_appointment', () => {
   // The refusal is English instructions for the model; a Dutch day name
   // ("vrijdag 25 december") in it could reach an English-speaking guest.
   test('names the day in English, like the rest of the message', async () => {
-    const res = await toolBookAppointment(PHONE, { session_type_id: FLOAT, start_date_time: '2026-12-25T10:00:00', client_name: 'Ann Smit', client_email: 'ann@example.com' });
+    const res = await toolBookAppointment(PHONE, { session_type_id: FLOAT, start_date_time: '2026-12-25T10:00:00', client_name: 'Ann Smit', client_email: 'ann@guest.fixture' });
     expect(res.message).toMatch(/Friday 25 December 2026/);
     expect(res.message).not.toMatch(/vrijdag/);
   });
 
   test('refuses a time outside special hours', async () => {
-    const res = await toolBookAppointment(PHONE, { session_type_id: FLOAT, start_date_time: '2026-12-31T15:30:00', client_name: 'Ann Smit', client_email: 'ann@example.com' });
+    const res = await toolBookAppointment(PHONE, { session_type_id: FLOAT, start_date_time: '2026-12-31T15:30:00', client_name: 'Ann Smit', client_email: 'ann@guest.fixture' });
     expect(res.error).toBe('closed');
     expect(mindbody.addAppointment).not.toHaveBeenCalled();
   });
@@ -132,7 +132,7 @@ describe('classes', () => {
   });
 
   test('booking a class on a closed day is refused', async () => {
-    const res = await toolBookClass(PHONE, { class_id: 7, session_type_id: 83, class_name: 'Vinyasa', class_date_time: '2026-12-25T10:00:00', client_name: 'Ann Smit', client_email: 'ann@example.com' });
+    const res = await toolBookClass(PHONE, { class_id: 7, session_type_id: 83, class_name: 'Vinyasa', class_date_time: '2026-12-25T10:00:00', client_name: 'Ann Smit', client_email: 'ann@guest.fixture' });
     expect(res.error).toBe('closed');
     expect(mindbody.addClientToClass).not.toHaveBeenCalled();
   });

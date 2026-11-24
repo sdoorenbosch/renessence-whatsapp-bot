@@ -96,6 +96,82 @@ describe('addAppointment — unclear answers are never retried', () => {
 });
 
 describe('read-only lookups', () => {
+  // Tara, 19 Nov 2026: the appointments endpoint gives a SessionTypeId, not a
+  // name, and the team books types the bot does not sell.
+  test('session type names: every type (no OnlineOnly), cached, and a failed refresh keeps the last good map', async () => {
+    const t0 = Date.now();
+    const now = jest.spyOn(Date, 'now').mockReturnValue(t0);
+    try {
+      mockApi.post.mockResolvedValue({ data: { AccessToken: 'tok' } });
+      mockApi.get.mockResolvedValue({ data: { SessionTypes: [{ Id: 37, Name: 'Lymphatic Drainage Massage' }, { Id: 620, Name: 'Couples Ritual' }, { Id: 1 }] } });
+      expect(await mb.getSessionTypeNames()).toEqual({ 37: 'Lymphatic Drainage Massage', 620: 'Couples Ritual' });
+      expect(mockApi.get).toHaveBeenCalledWith('/site/sessiontypes', expect.objectContaining({ params: { Limit: 200 } }));
+
+      // Cached: no second request within six hours.
+      now.mockReturnValue(t0 + 5 * 60 * 60 * 1000);
+      expect(await mb.getSessionTypeNames()).toEqual({ 37: 'Lymphatic Drainage Massage', 620: 'Couples Ritual' });
+      expect(mockApi.get).toHaveBeenCalledTimes(1);
+
+      // After six hours it refreshes; a failure keeps the last good map and never throws.
+      now.mockReturnValue(t0 + 7 * 60 * 60 * 1000);
+      mockApi.get.mockRejectedValue(Object.assign(new Error('Request failed with status code 400'), { response: { status: 400 } }));
+      expect(await mb.getSessionTypeNames()).toEqual({ 37: 'Lymphatic Drainage Massage', 620: 'Couples Ritual' });
+      expect(mockApi.get).toHaveBeenCalledTimes(2);
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  // Review of the Tara fix: the name list is awaited inside every lookup. A
+  // hanging endpoint must not hold the guest's answer, and a failing one must
+  // not cost every lookup another request.
+  test('session type names never hold a lookup for long, and a failure is remembered for a few minutes', async () => {
+    let fresh;
+    jest.isolateModules(() => { fresh = require('../src/services/mindbody.service'); });
+    jest.useFakeTimers();
+    try {
+      mockApi.post.mockResolvedValue({ data: { AccessToken: 'tok' } });
+      let answer;
+      mockApi.get.mockImplementation(() => new Promise((resolve) => { answer = resolve; }));
+      const first = fresh.getSessionTypeNames();
+      await jest.advanceTimersByTimeAsync(2000);
+      expect(await first).toEqual({});
+      // The request finishes in the background and fills the cache.
+      answer({ data: { SessionTypes: [{ Id: 620, Name: 'Couples Ritual' }] } });
+      await jest.advanceTimersByTimeAsync(0);
+      expect(await fresh.getSessionTypeNames()).toEqual({ 620: 'Couples Ritual' });
+      expect(mockApi.get).toHaveBeenCalledTimes(1);
+
+      let failing;
+      jest.isolateModules(() => { failing = require('../src/services/mindbody.service'); });
+      mockApi.get.mockReset();
+      mockApi.get.mockRejectedValue(Object.assign(new Error('Request failed with status code 400'), { response: { status: 400 } }));
+      expect(await failing.getSessionTypeNames()).toEqual({});
+      expect(await failing.getSessionTypeNames()).toEqual({});
+      expect(mockApi.get).toHaveBeenCalledTimes(1);
+      jest.advanceTimersByTime(6 * 60 * 1000);
+      await failing.getSessionTypeNames();
+      expect(mockApi.get).toHaveBeenCalledTimes(2);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  // Touriya review, Nov 2026: the booking tools take the address on this
+  // profile as the guest's own. "The first row" is somebody else whenever
+  // Mindbody ignores the id filter and answers with its first page of clients.
+  test('getClientById returns only the profile that was asked for — never just the first row', async () => {
+    mockApi.post.mockResolvedValue({ data: { AccessToken: 'tok' } });
+    mockApi.get.mockResolvedValue({ data: { Clients: [{ Id: '100000001', Email: 'someone.else@guest.fixture' }, { Id: '8', Email: 'hers@guest.fixture' }] } });
+    expect(await mb.getClientById(8)).toEqual({ Id: '8', Email: 'hers@guest.fixture' });
+    expect(mockApi.get).toHaveBeenCalledWith('/client/clients', expect.objectContaining({ params: { ClientIds: ['8'] } }));
+
+    mockApi.get.mockResolvedValue({ data: { Clients: [{ Id: '100000001', Email: 'someone.else@guest.fixture' }] } });
+    expect(await mb.getClientById(8)).toBeNull();
+    mockApi.get.mockResolvedValue({ data: { Clients: [] } });
+    expect(await mb.getClientById(8)).toBeNull();
+  });
+
   test('room occupancy: cancelled appointments free their room, NoShow ones still count', async () => {
     mockApi.post.mockResolvedValue({ data: { AccessToken: 'tok' } });
     mockApi.get.mockResolvedValue({ data: { Appointments: [

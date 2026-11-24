@@ -17,8 +17,11 @@ const TOOLS = [
             items: { type: 'integer' },
             description: 'Mindbody session type ID(s) for the treatment. Use all IDs for that treatment from the service catalog.',
           },
-          start_date: { type: 'string', description: 'Start date YYYY-MM-DD' },
+          start_date: { type: 'string', description: 'Start date YYYY-MM-DD, looked up in the Session calendar.' },
           end_date: { type: 'string', description: 'End date YYYY-MM-DD. Same as start_date for a single day.' },
+          // Melanie, 23 Nov 2026: she asked for "Saturday" and the model checked a
+          // Wednesday. With her weekday the server can refuse a date that is another day.
+          weekday: { type: 'string', enum: ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'], description: 'The weekday the customer named, in English, whenever they named one ("Saturday", "zaterdag", "next Friday"). The server checks it against the date and refuses the call when the date falls on another weekday. Leave it out only when the customer gave no weekday ("today", "tomorrow", "25 November").' },
           part_of_day: { type: 'string', enum: ['morning', 'afternoon', 'evening'], description: 'Pass this whenever the customer asks for a specific part of the day (morning <12:00, afternoon 12:00–17:00, evening ≥17:00). Without it the result is capped at the first 10 (earliest) times, so an afternoon/evening request would wrongly show only morning slots.' },
         },
         required: ['session_type_ids', 'start_date', 'end_date'],
@@ -29,7 +32,7 @@ const TOOLS = [
     type: 'function',
     function: {
       name: 'lookup_client',
-      description: 'Check if this customer already has an account in Mindbody (by phone number). Call this before asking for name/email.',
+      description: 'Check whether this customer is already known (their Mindbody profile, or what they gave at an earlier booking). Call it when the customer has picked a time, before the confirmation summary; the result says whether you still need to ask for their name and/or email address.',
       parameters: { type: 'object', properties: {} },
     },
   },
@@ -44,10 +47,10 @@ const TOOLS = [
           session_type_id: { type: 'integer', description: 'Mindbody session type ID' },
           start_date_time: { type: 'string', description: 'The dateTime of a slot returned by check_availability in this conversation, copied VERBATIM (e.g. 2026-05-01T09:00:00). Never construct or re-derive this from words like "today"/"this morning" — a datetime that was never offered is rejected (slot_not_offered).' },
           staff_id: { type: 'integer', description: 'Staff ID from the slot (0 if unknown)' },
-          client_name: { type: 'string', description: 'Full name of the person this booking is FOR. Needed for new customers, and ALWAYS for a booking for another person in the chat (a friend/partner) — each person gets their own booking.' },
-          client_email: { type: 'string', description: 'Email of the person this booking is FOR. Needed for new customers, and ALWAYS for another person in the chat.' },
+          client_name: { type: 'string', description: 'Full name (first and last name) of the person this booking is FOR, as the customer gave it; never make up a surname. Needed for new customers, and ALWAYS for a booking for another person in the chat (a friend/partner) — each person gets their own booking.' },
+          client_email: { type: 'string', description: 'Email address of the person this booking is FOR, copied exactly as the customer typed it in this chat. Leave it out only when lookup_client said email_on_file — the server then uses the address on file. NEVER invent, guess or complete an address: an address the customer did not type is rejected (email_required) and nothing is booked. Needed for new customers, when lookup_client said needs_email, and ALWAYS for another person in the chat.' },
           notes: { type: 'string', description: 'Optional notes to add to the appointment, e.g. add-on requests.' },
-          client_phone: { type: 'string', description: 'Customer phone number — required for web chat sessions where phone is not known from WhatsApp.' },
+          client_phone: { type: 'string', description: 'Customer phone number — required for web chat sessions where phone is not known from WhatsApp. Only a number the visitor typed in this chat; never make one up.' },
           replace_pending_payment: { type: 'boolean', description: 'Only after the result open_checkout_exists, when the customer wants the NEW time to REPLACE their unpaid earlier one.' },
           keep_pending_payment: { type: 'boolean', description: 'Only after the result open_checkout_exists, when the customer wants BOTH (the earlier unpaid one stays open).' },
         },
@@ -63,7 +66,7 @@ const TOOLS = [
       parameters: {
         type: 'object',
         properties: {
-          customer_email: { type: 'string', description: 'Customer email if known (used as the Stripe receipt address).' },
+          customer_email: { type: 'string', description: 'Only an address the customer typed in this chat (used as the Stripe receipt address); leave it out otherwise — the server uses the address on file. Never invent one.' },
           customer_name:  { type: 'string', description: 'Customer name if known.' },
         },
       },
@@ -73,14 +76,19 @@ const TOOLS = [
     type: 'function',
     function: {
       name: 'get_appointments',
-      description: "Get the customer's upcoming appointments from Mindbody. ALWAYS call this before cancel_appointments to obtain the real numeric appointment IDs — never guess or invent them.",
+      description: "Look up the customer's appointments in our booking system. The result is a server-built, complete list for the profile it names: tell the customer only what is in it. ALWAYS call this before cancel_appointments to obtain the real numeric appointment IDs — never guess or invent them.",
       parameters: {
         type: 'object',
         properties: {
           client_phone: { type: 'string', description: 'Customer phone number — fallback if not found by WhatsApp number.' },
           client_email: { type: 'string', description: 'Customer email — fallback lookup.' },
           client_name: { type: 'string', description: 'Customer full name — last-resort lookup if phone and email fail.' },
+          customer_expects: { type: 'string', description: "What the CUSTOMER says they have booked or asks you to confirm, in their own words (e.g. 'tomorrow two lymphatic drainage followed by two facials for me and my husband'). Pass \"\" when they only ask what they have booked, or want to cancel or reschedule. Never fill this from the lookup result." },
+          expected_date: { type: 'string', description: 'The day they mean, YYYY-MM-DD (see Today/Tomorrow in the Session section). Omit if they named no day.' },
+          expected_count: { type: 'integer', description: 'How many treatments they expect on that day in total, every person counted (a massage and a facial each for two people = 4). Omit if unsure.' },
+          expected_other_people: { type: 'boolean', description: 'true when what they describe includes anyone besides themselves.' },
         },
+        required: ['customer_expects'],
       },
     },
   },
@@ -103,7 +111,7 @@ const TOOLS = [
           },
           is_within_24h: {
             type: 'boolean',
-            description: 'Set true when isWithin24h is true for this appointment — suppresses refund notification to team (no refund within 24h per policy).',
+            description: 'Only a hint: the server works out on its own clock whether the appointment is within 24 hours (no refund within 24h per policy). Set true when isWithin24h was true for this appointment.',
           },
           service_name: {
             type: 'string',
@@ -111,7 +119,7 @@ const TOOLS = [
           },
           date_time: {
             type: 'string',
-            description: 'Human-readable date and time of the appointment being cancelled, e.g. "Saturday 23 May at 14:35". Used for the team notification email.',
+            description: 'Human-readable date and time of the appointment being cancelled, copied from the get_appointments result: "<dateLabel> at 14:35". Used for the team notification email.',
           },
         },
         required: ['appointment_ids'],
@@ -150,8 +158,9 @@ const TOOLS = [
           session_type_id: { type: 'integer', description: 'Session type ID (e.g. 83).' },
           class_name: { type: 'string', description: 'Human-readable class name (e.g. "Vinyasa Flow").' },
           class_date_time: { type: 'string', description: 'ISO datetime of the class, e.g. 2026-05-01T09:00:00.' },
-          client_name: { type: 'string', description: 'Full name. Only needed for new customers.' },
-          client_email: { type: 'string', description: 'Email. Only needed for new customers.' },
+          client_name: { type: 'string', description: 'Full name (first and last name), as the customer gave it; never make up a surname. Only needed for new customers.' },
+          client_email: { type: 'string', description: 'Email address, copied exactly as the customer typed it in this chat. Leave it out only when lookup_client said email_on_file — the server then uses the address on file. NEVER invent, guess or complete an address: an address the customer did not type is rejected (email_required) and nothing is booked. Needed for new customers and when lookup_client said needs_email.' },
+          client_phone: { type: 'string', description: 'Website chat only: the phone number the visitor typed in this chat, if any. Never make one up.' },
         },
         required: ['class_id', 'session_type_id', 'class_name', 'class_date_time'],
       },
@@ -161,14 +170,14 @@ const TOOLS = [
     type: 'function',
     function: {
       name: 'request_human_handoff',
-      description: 'Escalate to a human team member when the customer needs help the bot cannot provide. Always collect the customer email first before calling this.',
+      description: 'Escalate to a human team member when the customer needs help the bot cannot provide. This flags the chat and emails the team at once. On WhatsApp no email address is needed — the team answers in this chat. Only in the website chat: ask for the customer email first (the team cannot answer there).',
       parameters: {
         type: 'object',
         properties: {
           reason: { type: 'string', description: 'Why the customer needs human help.' },
-          customer_email: { type: 'string', description: 'Email address provided by the customer.' },
+          customer_email: { type: 'string', description: 'Only an address the customer typed in this chat; leave it out otherwise. Never invent one.' },
         },
-        required: ['reason', 'customer_email'],
+        required: ['reason'],
       },
     },
   },
@@ -176,17 +185,17 @@ const TOOLS = [
     type: 'function',
     function: {
       name: 'forward_reschedule_request',
-      description: "Forward a reschedule request to the Renessence team by email. Use when a customer wants to reschedule / move / change the date or time of an existing appointment. The bot does NOT reschedule itself. First state the reschedule policy, then collect the desired new date, the treatment (appointment type), and their email, then call this once. Do NOT call cancel_appointments or book_appointment for a reschedule.",
+      description: "Forward a reschedule request to the Renessence team by email. Use when a customer wants to reschedule / move / change the date or time of an existing appointment. The bot does NOT reschedule itself. First state the reschedule policy, then collect the desired new date and the treatment (appointment type), then call this once. On WhatsApp no email address is needed; only in the website chat ask for it first. Do NOT call cancel_appointments or book_appointment for a reschedule.",
       parameters: {
         type: 'object',
         properties: {
-          new_date: { type: 'string', description: 'The new date/time the customer would like, e.g. "Saturday 19 July, afternoon".' },
+          new_date: { type: 'string', description: 'The new date/time the customer would like, e.g. "<weekday> <day> <month>, afternoon" — with the date looked up in the Session calendar.' },
           treatment: { type: 'string', description: 'The treatment / appointment type to reschedule.' },
-          customer_email: { type: 'string', description: 'Customer email — required so the team can reach them.' },
+          customer_email: { type: 'string', description: 'Only an address the customer typed in this chat; leave it out otherwise. Never invent one.' },
           customer_name: { type: 'string', description: 'Customer name if known.' },
           current_appointment: { type: 'string', description: 'Any detail the customer gave about the current appointment being moved, e.g. "Float this Saturday at 15:00". Optional.' },
         },
-        required: ['new_date', 'treatment', 'customer_email'],
+        required: ['new_date', 'treatment'],
       },
     },
   },
@@ -214,9 +223,9 @@ const TOOLS = [
         properties: {
           gift_card_number: { type: 'string', description: 'The gift card / cadeaubon number the customer provided.' },
           treatment: { type: 'string', description: 'The treatment / appointment type the customer wants.' },
-          preferred_day: { type: 'string', description: 'The day (and time if given), e.g. "Saturday 12 July, afternoon".' },
+          preferred_day: { type: 'string', description: 'The day (and time if given), e.g. "<weekday> <day> <month>, afternoon" — with the date looked up in the Session calendar.' },
           customer_name: { type: 'string', description: 'Customer name if known.' },
-          customer_email: { type: 'string', description: 'Customer email. Required for an old-system card so the team can reach them.' },
+          customer_email: { type: 'string', description: 'Only an address the customer typed in this chat; leave it out otherwise. Never invent one.' },
           old_system: { type: 'boolean', description: 'Set true when check_gift_card reported is_old_system — flags the email as an old card needing manual transfer.' },
         },
         required: ['gift_card_number', 'treatment', 'preferred_day'],

@@ -90,7 +90,7 @@ const MASSAGE_80 = 32;   // €170, pay-online — over the team threshold on it
 const RED_LIGHT = 64;    // €45, pay-on-location
 const HYDROWAVE = 80;    // €35, pay-on-location
 const DAY = '2026-09-20';
-const CLIENT = { Id: 7, FirstName: 'Maria', LastName: 'T', Email: 'maria@example.com' };
+const CLIENT = { Id: 7, FirstName: 'Maria', LastName: 'T', Email: 'maria@guest.fixture' };
 
 const TEAM_THRESHOLD = payments.JOURNEY_TEAM_THRESHOLD_CENTS; // €150
 
@@ -109,7 +109,7 @@ function tapConfirm(offeredSlots) {
 
 const book = (session_type_id, time) => toolBookAppointment(PHONE, {
   session_type_id, start_date_time: `${DAY}T${time}:00`,
-  client_name: 'Maria T', client_email: 'maria@example.com',
+  client_name: 'Maria T', client_email: 'maria@guest.fixture',
 });
 
 async function flush(n = 8) { for (let i = 0; i < n; i++) await Promise.resolve(); }

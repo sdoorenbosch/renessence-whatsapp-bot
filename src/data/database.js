@@ -1,5 +1,6 @@
 const { Pool } = require('pg');
 const logger = require('../utils/logger');
+const { NON_TEXT_ACKS } = require('../config/non-text');
 
 // M2: validate SSL certs by default; set DB_SSL_SELF_SIGNED=true only for legacy self-signed cert DBs
 const pool = new Pool({
@@ -222,6 +223,21 @@ async function initialize() {
         created_at TIMESTAMPTZ DEFAULT NOW()
       );
 
+      -- What a guest told us once (Touriya, 27 Sep 2026: twelve days after she
+      -- had given her name and email, the bot booked her on an address nobody
+      -- typed). The email and full name a number gave, and the Mindbody profile
+      -- it books on, so a returning guest is recognised even when Mindbody
+      -- does not find them by phone. Personal data: it belongs with the
+      -- conversation history in any deletion request, and a row nobody booked
+      -- with for 24 months is removed at startup (below).
+      CREATE TABLE IF NOT EXISTS guest_contacts (
+        phone VARCHAR(64) PRIMARY KEY,
+        email VARCHAR(254),
+        full_name VARCHAR(100),
+        mindbody_client_id VARCHAR(32),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      );
+
       CREATE INDEX IF NOT EXISTS idx_conv_messages_phone ON conversation_messages(phone, created_at);
       CREATE INDEX IF NOT EXISTS idx_booking_events_created ON booking_events(created_at);
       CREATE INDEX IF NOT EXISTS idx_booking_events_status ON booking_events(status);
@@ -290,6 +306,10 @@ async function initialize() {
     if (pruneResult.rowCount > 0) {
       logger.info(`Pruned ${pruneResult.rowCount} conversation messages older than 6 months`);
     }
+
+    // A stored guest contact (email, name) is personal data too: it goes when
+    // nobody booked with it for two years — every booking refreshes updated_at.
+    await client.query(`DELETE FROM guest_contacts WHERE updated_at < NOW() - INTERVAL '24 months'`);
 
     logger.info('Database tables initialized');
   } finally {
@@ -1426,6 +1446,62 @@ async function loadConversationState(phone) {
   return res.rows[0]?.state || null;
 }
 
+// --- What a guest told us once (guest_contacts) ---
+// All three are best-effort and never throw: a database hiccup must read as
+// "nothing stored" / "nothing typed" (the guest is then simply asked), never
+// as a failed booking.
+
+/** The email, full name and Mindbody profile stored for this number, or null. */
+async function getGuestContact(phone) {
+  try {
+    const r = await pool.query(
+      `SELECT email, full_name, mindbody_client_id FROM guest_contacts WHERE phone = $1`,
+      [phone]
+    );
+    return r.rows[0] || null;
+  } catch (err) {
+    logger.warn('DB getGuestContact error:', err.message);
+    return null;
+  }
+}
+
+/** Remember what this number gave us. A missing value never overwrites a stored one. */
+async function saveGuestContact(phone, { email = null, fullName = null, mindbodyClientId = null } = {}) {
+  try {
+    await pool.query(
+      `INSERT INTO guest_contacts (phone, email, full_name, mindbody_client_id, updated_at)
+       VALUES ($1, $2, $3, $4, NOW())
+       ON CONFLICT (phone) DO UPDATE SET
+         email = COALESCE(EXCLUDED.email, guest_contacts.email),
+         full_name = COALESCE(EXCLUDED.full_name, guest_contacts.full_name),
+         mindbody_client_id = COALESCE(EXCLUDED.mindbody_client_id, guest_contacts.mindbody_client_id),
+         updated_at = NOW()`,
+      [phone, email || null, fullName ? String(fullName).slice(0, 100) : null, mindbodyClientId != null ? String(mindbodyClientId) : null]
+    );
+  } catch (err) {
+    logger.warn('DB saveGuestContact error:', err.message);
+  }
+}
+
+/**
+ * The guest's own messages that contain an "@" (newest first, at most 50):
+ * where the "typed by the guest" check looks once the 30-minute memory is gone.
+ */
+async function getGuestTypedTexts(phone) {
+  try {
+    const r = await pool.query(
+      `SELECT content FROM conversation_messages
+       WHERE phone = $1 AND role = 'user' AND position('@' in content) > 0
+       ORDER BY created_at DESC LIMIT 50`,
+      [phone]
+    );
+    return r.rows.map(row => row.content);
+  } catch (err) {
+    logger.warn('DB getGuestTypedTexts error:', err.message);
+    return [];
+  }
+}
+
 /**
  * Has this customer's current conversation been handed to a human (handoff
  * requested) or is the bot paused for them? Used to stop automated payment
@@ -1583,6 +1659,38 @@ async function getMessagesByPhone(phone, limit = 500, opts = {}) {
     // from scratch mid-booking. Dashboard callers keep the lenient default.
     if (opts.strict) throw err;
     return [];
+  }
+}
+
+/**
+ * The newest message sent TO this guest (bot or colleague; the dashboard's own
+ * "📨 …" notes are not messages), with how many guest messages came after it,
+ * and the outbound message before it as `previous` (the pause notice is often
+ * the newest; the colleague's question sits before it). Tara, 4 Nov 2026: the
+ * message handler keeps a reply to a colleague with the team. null when there
+ * is none or on a database error — the bot then behaves as it always did.
+ */
+async function getLastOutboundMessage(phone) {
+  try {
+    const res = await pool.query(
+      `SELECT m.role, m.content, m.created_at,
+              (SELECT COUNT(*) FROM conversation_messages u
+                WHERE u.phone = m.phone AND u.role = 'user' AND u.created_at > m.created_at)::int AS guest_replies_after
+       FROM conversation_messages m
+       WHERE m.phone = $1 AND m.role <> 'user' AND m.content NOT LIKE '📨 %'
+         AND m.content <> ALL($2::text[])
+       ORDER BY m.created_at DESC
+       LIMIT 2`,
+      // The automatic answer to a photo or sticker is not a reply: a
+      // colleague's message before it is still the one the guest is answering
+      // (found in review: the ack hid the colleague's open question).
+      [phone, NON_TEXT_ACKS]
+    );
+    const [last, previous] = res.rows || [];
+    return last ? { ...last, previous: previous || null } : null;
+  } catch (err) {
+    logger.error('DB getLastOutboundMessage error:', err.message);
+    return null;
   }
 }
 
@@ -1790,10 +1898,14 @@ module.exports = {
   getMessagesByPhone,
   getMessagesSince,
   getLastInboundMessageAt,
+  getLastOutboundMessage,
   getLastMessageAt,
   claimPromoMessage,
   saveConversationState,
   loadConversationState,
+  getGuestContact,
+  saveGuestContact,
+  getGuestTypedTexts,
   isHumanHandling,
   getUnansweredConversations,
   getOpenJourneyForDay,
