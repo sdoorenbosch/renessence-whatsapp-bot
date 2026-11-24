@@ -818,7 +818,7 @@ describe('get_appointments', () => {
   const END_OF_MONTH = { Id: 8003, StartDateTime: '2026-11-29T10:00:00', SessionType: { Name: 'Hydrowave Massage' } };
 
   beforeEach(() => {
-    mindbody.getClientByPhone.mockResolvedValue({ Id: 7 });
+    mindbody.getClientByPhone.mockResolvedValue({ Id: 7, MobilePhone: PHONE }); // her WhatsApp number is on it
     mindbody.getStaffAppointments.mockResolvedValue([LAST_WEEK, IN_THREE_HOURS, END_OF_MONTH]);
   });
   const lookUp = async () => (await tools.toolGetAppointments(PHONE, { client_email: 'guest@example.com' })).appointments;

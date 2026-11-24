@@ -1015,6 +1015,35 @@ function typedPhone(from, phone) {
   return typed ? String(phone).trim() : null;
 }
 
+/** The last nine digits: "+31 6 1234 5678", "0612345678" and "31612345678" all give "612345678". */
+function phoneTail(phone) {
+  const digits = String(phone || '').replace(/\D/g, '');
+  return digits.length >= 9 ? digits.slice(-9) : null;
+}
+
+/**
+ * Is this phone number on the profile? Security review, 24 Nov 2026: a typed
+ * email address is not proof that the profile carrying it is the typer's —
+ * anyone who knows a guest's address can type it. A profile found by email,
+ * name or another number is only used when the number we trust (the WhatsApp
+ * sender, or in the website chat a number the visitor typed) is on it.
+ */
+function profileHasPhone(client, phone) {
+  const tail = phoneTail(phone);
+  return !!tail && [client?.MobilePhone, client?.HomePhone, client?.WorkPhone].some(p => phoneTail(p) === tail);
+}
+
+/** The refusal when a profile exists for these details but is not this guest's to use. */
+function profileNotLinked(from) {
+  return {
+    error: 'profile_not_linked',
+    nothing_booked: true,
+    message: isWebSession(from)
+      ? 'NOTHING was booked. A profile with these details exists, but not with a phone number the visitor typed in this chat, so it cannot be used here. Say nothing about that profile. Ask once for the phone number they use at Renessence (only a number they type counts); if they already gave it, point them to renessence.com/booking or welcome@renessence.com.'
+      : 'NOTHING was booked. A profile with these details exists in our system, but it is not linked to this WhatsApp number, so you may not book on it. Say nothing about that profile (no name, no details, not even that it exists under another number). Tell the customer our team will complete the booking here in the chat, and call request_human_handoff with a reason starting "Profile not linked to this number - book by hand:" followed by name, email, treatment, date and time.',
+  };
+}
+
 // One word of a name: letters, with - ' . inside ("Jan-Willem", "O'Brien").
 const NAME_WORD = /^\p{L}[\p{L}\p{M}'’.-]*$/u;
 
@@ -1173,10 +1202,17 @@ async function resolveBookingGuest(from, { client_name, client_email, client_pho
   const vetted = await vetGuestEmail(from, client_email, [profileEmail, storedEmail]);
   const email = vetted.ok ? vetted.email : null;
 
+  // The number that proves a profile is theirs: the WhatsApp sender, or in
+  // the website chat a number the visitor typed.
+  const ownPhone = isWeb ? newProfilePhone : from;
   if (!client && (email || storedEmail)) {
-    client = await mindbodyService.searchClientByEmail(email || storedEmail);
-    // The search only returns a profile that carries exactly this address.
-    if (client) profileEmail = email || storedEmail;
+    const found = await mindbodyService.searchClientByEmail(email || storedEmail);
+    if (found) {
+      if (!profileHasPhone(found, ownPhone)) return { refusal: profileNotLinked(from) };
+      client = found;
+      // The search only returns a profile that carries exactly this address.
+      profileEmail = email || storedEmail;
+    }
   }
 
   let forSomeoneElse = false;
@@ -1218,6 +1254,8 @@ async function resolveBookingGuest(from, { client_name, client_email, client_pho
           ? await mindbodyService.searchClientByEmail(newEmail)
           : await mindbodyService.getClientByPhone(from, newEmail);
         if (!client) throw addErr;
+        // Found by the address only: the same rule as above.
+        if (!profileHasPhone(client, ownPhone)) return { refusal: profileNotLinked(from) };
       } else throw addErr;
     }
     profileEmail = newEmail;
@@ -2651,25 +2689,37 @@ const CANT_COME = /\b(?:can['’]?t|cannot|can\s+not|won['’]?t|will\s+not|not\
  */
 async function toolGetAppointments(from, { client_phone, client_email, client_name, ...expectArgs } = {}) {
   let clients = [];
+  let foundOthers = false;
 
-  // Helper: try all lookup strategies in order
+  // Helper: try all lookup strategies in order. Security review, 24 Nov 2026:
+  // the email, name or number the customer gives only finds a profile; its
+  // appointments are shown only when the number we trust is on it (the
+  // WhatsApp sender; in the website chat a number the visitor typed).
+  // Profiles found by the sender's own number are theirs by definition.
   async function tryLookups(primaryPhone) {
-    if (primaryPhone && !primaryPhone.startsWith('web_')) {
-      clients = await mindbodyService.getAllClientsByPhone(primaryPhone);
-    }
+    const web = isWebSession(from);
+    const ownPhone = web ? typedPhone(from, client_phone) : from;
+    const owned = (list) => list.filter(c => profileHasPhone(c, ownPhone));
+    const byOwnNumber = (primaryPhone && !web) ? await mindbodyService.getAllClientsByPhone(primaryPhone) : [];
+    clients = byOwnNumber;
     if (clients.length === 0 && client_phone) {
-      clients = await mindbodyService.getAllClientsByPhone(client_phone);
+      const byNumber = await mindbodyService.getAllClientsByPhone(client_phone);
+      // The website visitor's number alone proves nothing: email AND number.
+      clients = web ? [] : owned(byNumber);
+      if (byNumber.length > clients.length) foundOthers = true;
     }
-    // If the customer explicitly provided their email, ALWAYS search by it —
-    // even if the phone lookup found someone. The phone may have matched a
-    // different person (e.g. the agent's own number), so email takes priority.
+    // The email the customer gave takes priority over the phone result (the
+    // phone may have matched a different person, e.g. the agent's own number)
+    // — when it is theirs.
     if (client_email) {
       const c = await mindbodyService.getClientByPhone(null, client_email);
-      if (c) clients = [c]; // override phone result with the email match
+      if (c && (profileHasPhone(c, ownPhone) || byOwnNumber.some(o => String(o.Id) === String(c.Id)))) clients = [c];
+      else if (c) foundOthers = true;
     }
     if (clients.length === 0 && client_name) {
       const c = await mindbodyService.searchClientByName(client_name);
-      if (c) clients = [c];
+      if (c && !web && profileHasPhone(c, ownPhone)) clients = [c];
+      else if (c) foundOthers = true;
     }
   }
 
@@ -2704,6 +2754,15 @@ async function toolGetAppointments(from, { client_phone, client_email, client_na
   }
 
   await tryLookups(from);
+
+  if (clients.length === 0 && foundOthers) {
+    return {
+      status: 'not_linked',
+      instruction: isWebSession(from)
+        ? 'A profile with these details exists, but not with a phone number the visitor typed here, so you may not show anything from it. Say nothing about that profile. Ask once for the phone number they use at Renessence (only a number they type counts); if they already gave it, point them to welcome@renessence.com.'
+        : 'A profile with these details exists, but it is not linked to this WhatsApp number, so you may not show anything from it. Say nothing about that profile (no name, no appointments, not even that it exists under another number). Call request_human_handoff (reason: booking lookup - details not linked to this number, plus what they asked) and say the team will check and reply here.',
+    };
+  }
 
   if (clients.length === 0) {
     if (expectation.customer_expects) conversationService.set(from, { lookupExpectation: { ...expectation, at: Date.now() } });
