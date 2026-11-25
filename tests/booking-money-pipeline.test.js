@@ -682,7 +682,7 @@ describe('cancellation refund safety (re-gate)', () => {
 
   beforeEach(() => {
     // The customer tapped "Yes, cancel it" — the hard cancellation gate.
-    conversations.set(PHONE, { lang: 'en', cancelConfirmedAt: Date.now() });
+    conversations.set(PHONE, { lang: 'en', cancelConfirmedAt: Date.now(), knownAppointments: { 9001: { serviceName: 'Tailored Massage' } } });
   });
 
   test('a failed paid-row lookup flags paid-state-unknown instead of skipping the refund silently', async () => {

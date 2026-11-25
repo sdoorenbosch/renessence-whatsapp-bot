@@ -1092,7 +1092,7 @@ describe('7. a day forwarded to the team comes with a date check — and is neve
   });
 
   test('cancel_appointments: the cancellation goes through, the email to the team carries the note', async () => {
-    conversations.set(PHONE, { lang: 'en', userName: 'Melanie', cancelConfirmedAt: Date.now() });
+    conversations.set(PHONE, { lang: 'en', userName: 'Melanie', cancelConfirmedAt: Date.now(), knownAppointments: { 9001: { serviceName: 'Finnish Sauna' } } });
     const r = await tools.toolCancelAppointments(PHONE, { appointment_ids: [9001], service_name: 'Finnish Sauna', date_time: 'Saturday 25 November at 14:15' });
     expect(r.cancelled).toEqual([9001]);
     expect(mindbody.cancelAppointment).toHaveBeenCalledWith(9001);
@@ -1459,7 +1459,7 @@ describe('8. found in review', () => {
   });
 
   test('a cancellation by id with a weekday and no date adds no note', async () => {
-    conversations.set(PHONE, { lang: 'en', userName: 'Melanie', cancelConfirmedAt: Date.now() });
+    conversations.set(PHONE, { lang: 'en', userName: 'Melanie', cancelConfirmedAt: Date.now(), knownAppointments: { 9001: { serviceName: 'Finnish Sauna' } } });
     const r = await tools.toolCancelAppointments(PHONE, { appointment_ids: [9001], service_name: 'Finnish Sauna', date_time: 'Saturday at 14:15' });
     expect(r.cancelled).toEqual([9001]);
     expect(email.sendCancellationNotificationEmail.mock.calls[0][0]).not.toHaveProperty('dateNote');

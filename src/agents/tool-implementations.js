@@ -2916,6 +2916,18 @@ async function toolGetAppointments(from, { client_phone, client_email, client_na
   };
 }
 
+// Appointment ids this sender may cancel: the ones get_appointments showed
+// them (it only lists profiles that carry the sender's own number) plus the
+// ones booked in this chat. Kept in conversation state, keyed by sender.
+function ownedAppointmentIds(from) {
+  const conv = conversationService.get(from) || {};
+  const ids = new Set(Object.keys(conv.knownAppointments || {}));
+  for (const b of conv.pendingBookings || []) {
+    if (b?.appointment_id != null) ids.add(String(b.appointment_id));
+  }
+  return ids;
+}
+
 async function toolCancelAppointments(from, { appointment_ids, is_reschedule, is_within_24h, service_name, date_time }) {
   // HARD GATE — never cancel without an explicit "Yes, cancel it" tap.
   // The prompt already demanded a confirmation, but nothing enforced it: a
@@ -2931,6 +2943,28 @@ async function toolCancelAppointments(from, { appointment_ids, is_reschedule, is
       message: 'You do NOT have the customer\'s explicit cancellation confirmation, so nothing was cancelled. If — and only if — they actually want to cancel, first show the confirmation with buttons [{"id":"confirm_cancel","title":"Yes, cancel it"},{"id":"keep_appointment","title":"No, keep it"}], naming the exact treatment, date and time (and the 100% charge if within 24h). Only call cancel_appointments after they tap "Yes, cancel it". IMPORTANT: a question about availability, a later time, or whether someone else cancelled is NOT a cancellation request — answer it without cancelling anything.',
     };
   }
+  // OWNERSHIP GATE (security audit, 25 Nov 2026). The ids come from the model,
+  // and the model reads untrusted text: without this check anyone who knew or
+  // guessed an appointment id could have someone else's booking cancelled.
+  // Only ids this sender was shown by get_appointments (which only lists
+  // profiles that carry the sender's number) or booked in this chat count.
+  // The rest is refused; the confirmation is kept, so after a fresh
+  // get_appointments the same tap still covers the cancel.
+  const ownIds = ownedAppointmentIds(from);
+  const requested = Array.isArray(appointment_ids) ? appointment_ids : [];
+  const allowedIds = requested.filter(id => ownIds.has(String(id)));
+  const refusedIds = requested.filter(id => !ownIds.has(String(id)));
+  if (refusedIds.length > 0) {
+    logger.warn(`[${from}] cancel_appointments refused for appointment(s) not shown to this guest: ${refusedIds.join(', ')}`);
+  }
+  if (allowedIds.length === 0) {
+    return {
+      error: 'appointment_not_verified',
+      refused: refusedIds,
+      message: 'Nothing was cancelled: these appointments are not in the list get_appointments showed this customer in this chat. Call get_appointments first and cancel only an appointment from that list. If it is not there, it is not on this customer\'s profile: do not cancel it, tell the customer kindly that you cannot find it under their number, and offer the team (request_human_handoff).',
+    };
+  }
+
   // Consume the confirmation so it covers exactly one cancellation.
   conversationService.update(from, { cancelConfirmedAt: null });
 
@@ -2953,7 +2987,7 @@ async function toolCancelAppointments(from, { appointment_ids, is_reschedule, is
   const dateNote = dateCheckNote(date_time, { lone: 'none' });
   logDateCheck(from, customerName, dateNote);
 
-  for (const id of appointment_ids) {
+  for (const id of allowedIds) {
     try {
       // Look up booking details from DB before cancelling (needed for refund email).
       // "The query FAILED" and "no paid row exists" are different answers: the
@@ -3124,6 +3158,10 @@ async function toolCancelAppointments(from, { appointment_ids, is_reschedule, is
   return {
     cancelled,
     failed,
+    ...(refusedIds.length > 0 ? {
+      refused: refusedIds,
+      refused_note: 'These appointments were NOT cancelled: they are not in the list get_appointments showed this customer. Do not retry them; tell the customer you cannot find them under their number and offer the team.',
+    } : {}),
     ...(cancelledLate.length > 0 ? { within24h: true } : {}),
     ...(notes.length > 0 ? { policy_note: notes.join(' ') } : {}),
   };

@@ -617,7 +617,11 @@ describe('cancel_appointments: the server decides what "inside 24 hours" is', ()
   const REFUND_TEXT = /terugbetaling binnen 7 werkdagen|refund within 7 business days/;
   const paid = () => db.query.mockImplementation(async (sql) => (String(sql).includes("status = 'paid'") ? { rows: [PAID_ROW] } : { rows: [] }));
   /** The handler's effect of a "Yes, cancel it" tap. */
-  const tapYesCancel = (extra = {}) => conversations.set(PHONE, { lang: 'nl', cancelConfirmedAt: Date.now(), ...extra });
+  // Since the ownership gate (25 Nov 2026) only appointments of this guest can
+  // be cancelled: here they were booked in this chat, so the server has no
+  // start time for them (the fallbacks below are about exactly that case).
+  const BOOKED_HERE = [9001, 9002, 9003].map(id => ({ appointment_id: id }));
+  const tapYesCancel = (extra = {}) => conversations.set(PHONE, { lang: 'nl', cancelConfirmedAt: Date.now(), pendingBookings: BOOKED_HERE, ...extra });
   const mindbodySays = (startDateTime) => mindbody.cancelAppointment.mockResolvedValue({ Status: 'Cancelled', StartDateTime: startDateTime });
 
   test('without the "Yes, cancel it" tap nothing happens, however close the appointment is', async () => {
