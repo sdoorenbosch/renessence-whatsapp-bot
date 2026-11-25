@@ -18,9 +18,34 @@ function pruneOldSessions() {
   }
 }
 
+// Daily budget per IP (security audit, 25 Nov 2026), on top of the per-minute
+// rate limit in server.js: every session can make paid model calls, so one
+// address gets at most WEBCHAT_SESSIONS_PER_IP_DAY new sessions per day.
+// In memory: a restart resets it, which is acceptable for a cost cap.
+const SESSIONS_PER_IP_DAY = Number(process.env.WEBCHAT_SESSIONS_PER_IP_DAY) || 30;
+const sessionsPerIp = new Map(); // ip → count, for budgetDay
+let budgetDay = null;
+
+function overDailyBudget(ip) {
+  const today = new Date().toISOString().slice(0, 10);
+  if (budgetDay !== today) {
+    sessionsPerIp.clear();
+    budgetDay = today;
+  }
+  const key = ip || 'unknown';
+  const used = sessionsPerIp.get(key) || 0;
+  if (used >= SESSIONS_PER_IP_DAY) return true;
+  sessionsPerIp.set(key, used + 1);
+  return false;
+}
+
 // GET /webchat/init — returns a server-generated session ID
 router.get('/init', (req, res) => {
   pruneOldSessions();
+  if (overDailyBudget(req.ip)) {
+    logger.warn('Webchat: daily session budget reached for an IP');
+    return res.status(429).json({ error: 'Too many chat sessions today. Please try again tomorrow or contact us by email.' });
+  }
   if (activeSessions.size >= MAX_SESSIONS) {
     return res.status(429).json({ error: 'Too many active sessions' });
   }
@@ -55,3 +80,4 @@ router.post('/message', async (req, res) => {
 });
 
 module.exports = router;
+module.exports._resetDailyBudget = () => { sessionsPerIp.clear(); budgetDay = null; };

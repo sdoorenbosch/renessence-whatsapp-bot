@@ -23,11 +23,17 @@ function verifyWhatsAppSignature(req) {
   const signature = req.headers['x-hub-signature-256'];
   if (!signature) return false;
   const expected = 'sha256=' + crypto.createHmac('sha256', appSecret).update(req.rawBody || JSON.stringify(req.body)).digest('hex');
-  try {
-    return crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
-  } catch {
-    return false;
-  }
+  return safeEqual(String(signature), expected);
+}
+
+// Constant-time string comparison (security audit, 25 Nov 2026). Lengths are
+// compared first because timingSafeEqual throws on unequal lengths.
+function safeEqual(given, expected) {
+  if (typeof given !== 'string' || typeof expected !== 'string' || !expected) return false;
+  const a = Buffer.from(given);
+  const b = Buffer.from(expected);
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
 }
 
 // Deduplication: in-memory cache for hot path + DB fallback that survives restarts.
@@ -62,9 +68,10 @@ router.get('/', (req, res) => {
   const token = req.query['hub.verify_token'];
   const challenge = req.query['hub.challenge'];
 
-  if (mode === 'subscribe' && token === config.WHATSAPP_VERIFY_TOKEN) {
+  if (mode === 'subscribe' && safeEqual(token, config.WHATSAPP_VERIFY_TOKEN)) {
     logger.info('Webhook verified successfully');
-    return res.status(200).send(challenge);
+    // Plain text: the challenge is echoed back and must never render as HTML.
+    return res.status(200).type('text/plain').send(String(challenge ?? ''));
   }
   logger.warn('Webhook verification failed');
   return res.sendStatus(403);
@@ -175,3 +182,4 @@ router.post('/', async (req, res) => {
 });
 
 module.exports = router;
+module.exports.safeEqual = safeEqual;

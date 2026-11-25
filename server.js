@@ -30,7 +30,12 @@ const app = express();
 app.set('trust proxy', 1);
 
 // L2: security headers
-app.use(helmet({ contentSecurityPolicy: false })); // CSP off — widget iframe needs flexibility
+// CSP on (security audit, 25 Nov 2026). This server only serves JSON, images,
+// widget.js and a static preview page; the widget runs as a script on the
+// website, where the website's own CSP applies, not this one. Helmet's
+// defaults (script-src 'self', inline styles allowed, frame-ancestors 'self',
+// object-src 'none') cover what is served here.
+app.use(helmet());
 
 // H2: rate limiting per route
 const webhookLimiter  = rateLimit({ windowMs: 60_000, max: 100, standardHeaders: true, legacyHeaders: false });
@@ -104,37 +109,6 @@ app.get('/health', (req, res) => {
     assistant: outage || { status: 'ok' },
     heartbeat: HEARTBEAT_ENABLED ? 'on' : 'off',
   });
-});
-
-// TEMP diagnostic — remove after use. Read-only, key-gated. Reports the RAW
-// Mindbody availability windows (StartDateTime/EndDateTime/staff) per session
-// type for a date, plus bookable-item counts, to see exactly what Mindbody
-// returns (e.g. whether a room's weekend window runs too late).
-app.get('/diag/avail', async (req, res) => {
-  if (req.query.key !== 'renessence-diag-2026') return res.status(404).end();
-  try {
-    const mb = require('./src/services/mindbody.service');
-    const start = req.query.start || '2026-07-12';
-    const end = req.query.end || '2026-07-12';
-    const ids = (req.query.ids || '58').split(',').map(s => s.trim()).filter(Boolean).map(Number);
-    const out = {};
-    for (const id of ids) {
-      try {
-        const items = await mb.getBookableItems(id, start, end);
-        out[id] = {
-          count: items.length,
-          windows: items.map(it => ({
-            start: it.StartDateTime,
-            end: it.EndDateTime,
-            staff: it.Staff?.Name || it.Staff?.Id || null,
-          })),
-        };
-      } catch (e) { out[id] = { error: `ERR ${e.response?.status || e.message}` }; }
-    }
-    res.json({ start, end, tz: process.env.TZ || '(unset)', serverNow: new Date().toString(), items: out });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
 });
 
 // WhatsApp webhook

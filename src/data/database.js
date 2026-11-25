@@ -772,6 +772,8 @@ async function updateBookingEventIfStatus(id, allowedStatuses, updates, expected
   let idx = 1;
   for (const [key, val] of Object.entries(updates)) {
     const col = key.replace(/([A-Z])/g, '_$1').toLowerCase();
+    // Column names go into the SQL text: only plain identifiers (audit 25 Nov 2026).
+    if (!/^[a-z][a-z0-9_]*$/.test(col)) throw new Error(`Invalid column name: ${key}`);
     fields.push(`${col} = $${idx}`);
     values.push(val);
     idx++;
@@ -803,6 +805,8 @@ async function updateBookingEvent(id, updates) {
   let idx = 1;
   for (const [key, val] of Object.entries(updates)) {
     const col = key.replace(/([A-Z])/g, '_$1').toLowerCase();
+    // Column names go into the SQL text: only plain identifiers (audit 25 Nov 2026).
+    if (!/^[a-z][a-z0-9_]*$/.test(col)) throw new Error(`Invalid column name: ${key}`);
     fields.push(`${col} = $${idx}`);
     values.push(val);
     idx++;
@@ -979,6 +983,8 @@ async function updateBookingByStripeSession(stripeSessionId, updates) {
   let idx = 1;
   for (const [key, val] of Object.entries(updates)) {
     const col = key.replace(/([A-Z])/g, '_$1').toLowerCase();
+    // Column names go into the SQL text: only plain identifiers (audit 25 Nov 2026).
+    if (!/^[a-z][a-z0-9_]*$/.test(col)) throw new Error(`Invalid column name: ${key}`);
     fields.push(`${col} = $${idx}`);
     values.push(val);
     idx++;
